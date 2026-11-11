@@ -5,13 +5,39 @@ import { state, setUI, setPlayhead, beginTxn, endTxn, cancelTxn, touch } from '.
 import * as M from '../core/model.js';
 import * as A from '../core/actions.js';
 import { evalProp, setKey } from '../core/keyframes.js';
-import { clamp, h } from '../core/util.js';
+import { clamp, h, formatTC } from '../core/util.js';
 import { previewUrl } from '../media/library.js';
 import { engine } from '../playback/engine.js';
 import { toast } from '../ui/widgets.js';
 import { icon } from '../ui/icons.js';
 
 const PROPS = ['x', 'y', 'w', 'h'];
+
+// Umbrales de parecido (correlación normalizada, de -1 a 1). Son relativos al parecido habitual
+// de cada objeto (`typical`), porque no todas las imágenes se dejan comparar igual de bien.
+const limits = (typical) => ({
+  ok: clamp(typical * 0.62, 0.3, 0.5), // por debajo, el objeto se da por tapado
+  back: clamp(typical * 0.75, 0.42, 0.62), // para darlo por reencontrado tras haberlo perdido
+  learn: clamp(typical * 0.85, 0.5, 0.7), // solo se aprende el aspecto nuevo si se ve con claridad
+  sure: clamp(typical * 0.92, 0.6, 0.8), // con este parecido se acepta aunque haya dado un salto
+});
+const MAX_HIDDEN = 1.2; // segundos que se sigue por inercia antes de detenerse
+
+/** Suavizado 3×3: hace la comparación tolerante a desplazamientos de menos de un píxel. */
+function blur3(a, w, hh) {
+  const tmp = new Float32Array(a.length);
+  for (let y = 0; y < hh; y++) {
+    const o = y * w;
+    for (let x = 0; x < w; x++) tmp[o + x] = (a[o + Math.max(0, x - 1)] + a[o + x] + a[o + Math.min(w - 1, x + 1)]) / 3;
+  }
+  for (let y = 0; y < hh; y++) {
+    const o = y * w;
+    const up = Math.max(0, y - 1) * w;
+    const dn = Math.min(hh - 1, y + 1) * w;
+    for (let x = 0; x < w; x++) a[o + x] = (tmp[up + x] + tmp[o + x] + tmp[dn + x]) / 3;
+  }
+  return a;
+}
 let job = null;
 let hud = null;
 
@@ -99,7 +125,16 @@ function search(T, tw, th, S, sw, sh) {
       if (sc > best.score) best = { ox, oy, score: sc };
     }
   }
-  return best;
+  // Ajuste por debajo del píxel: vértice de la parábola que pasa por el máximo y sus vecinos.
+  const peak = (lo, mid, hi) => {
+    const den = lo - 2 * mid + hi;
+    return den < -1e-9 ? clamp((0.5 * (lo - hi)) / den, -0.5, 0.5) : 0;
+  };
+  let fx = 0;
+  let fy = 0;
+  if (best.ox > 0 && best.ox < maxX) fx = peak(scoreAt(best.ox - 1, best.oy), best.score, scoreAt(best.ox + 1, best.oy));
+  if (best.oy > 0 && best.oy < maxY) fy = peak(scoreAt(best.ox, best.oy - 1), best.score, scoreAt(best.ox, best.oy + 1));
+  return { ox: best.ox + fx, oy: best.oy + fy, score: best.score };
 }
 
 /** Reduce la lista de muestras a los keyframes necesarios (Ramer–Douglas–Peucker en el tiempo). */
@@ -186,7 +221,7 @@ export async function trackCensor(clip, region) {
   }
   engine.pause();
   const ts0 = A.clipTs(clip);
-  const tsEnd = Math.min(clip.in + clip.duration, region.end ?? Infinity, media.duration - 0.04);
+  const tsEnd = Math.min(M.sourceEnd(clip), region.end ?? Infinity, media.duration - 0.04);
   if (tsEnd - ts0 < 0.15) {
     toast('Coloca el cursor antes del final del clip para seguir el objeto');
     return;
@@ -228,6 +263,14 @@ export async function trackCensor(clip, region) {
     const sw = tw + 2 * R;
     const sh = th + 2 * R;
 
+    // Cada fotograma se copia una sola vez y todo el análisis trabaja sobre esa copia: si se
+    // leyera del video varias veces, este podría haber avanzado entre una lectura y la siguiente.
+    const fk = Math.min(1, 1920 / vw);
+    const frame = new OffscreenCanvas(Math.max(2, Math.round(vw * fk)), Math.max(2, Math.round(vh * fk)));
+    const fctx = frame.getContext('2d');
+    const grab = () => fctx.drawImage(el, 0, 0, frame.width, frame.height);
+    grab();
+
     const cv = new OffscreenCanvas(sw, sh);
     const ctx = cv.getContext('2d', { willReadFrequently: true });
     const sample = (sx, sy, w, hh, dw, dh) => {
@@ -235,13 +278,14 @@ export async function trackCensor(clip, region) {
         cv.width = dw;
         cv.height = dh;
       }
+      ctx.imageSmoothingQuality = 'high';
       ctx.fillStyle = '#808080';
       ctx.fillRect(0, 0, dw, dh);
-      ctx.drawImage(el, sx, sy, w, hh, 0, 0, dw, dh);
+      ctx.drawImage(frame, sx * fk, sy * fk, w * fk, hh * fk, 0, 0, dw, dh);
       const d = ctx.getImageData(0, 0, dw, dh).data;
       const out = new Float32Array(dw * dh);
       for (let i = 0, q = 0; i < out.length; i++, q += 4) out[i] = d[q] * 0.299 + d[q + 1] * 0.587 + d[q + 2] * 0.114;
-      return out;
+      return blur3(out, dw, dh);
     };
     const patchAt = (cx, cy, w, hh) => {
       const a = sample(cx - w / 2, cy - hh / 2, w, hh, tw, th);
@@ -256,9 +300,31 @@ export async function trackCensor(clip, region) {
 
     const samples = [{ t: ts0, x: cur.x / vw, y: cur.y / vh, w: cur.w / vw, h: cur.h / vh }];
     let vel = { x: 0, y: 0 };
+    let typical = 0; // parecido habitual del objeto cuando se ve bien
     let lastT = ts0;
-    let lost = 0;
+    let hiddenAt = null; // instante en que se dejó de ver el objeto (null = a la vista)
+    let gaveUp = false;
+    let seen = { t: ts0, x: cur.x, y: cur.y }; // última vez que se vio con seguridad
     let lastUi = 0;
+
+    /** Mejor coincidencia de la plantilla alrededor de (px, py), buscando `radius` píxeles de análisis. */
+    const locate = (px, py, radius) => {
+      const k = tw / cur.w; // píxeles de análisis por píxel de video
+      const w = tw + 2 * radius;
+      const hh = th + 2 * radius;
+      const S = sample(px - cur.w / 2 - radius / k, py - cur.h / 2 - radius / k, w / k, hh / k, w, hh);
+      const m = search(T, tw, th, S, w, hh);
+      return { score: m.score, x: px - cur.w / 2 - radius / k + (m.ox + tw / 2) / k, y: py - cur.h / 2 - radius / k + (m.oy + th / 2) / k };
+    };
+    const progress = (mt, force) => {
+      const now = performance.now();
+      if (!force && now - lastUi < 110) return;
+      lastUi = now;
+      hud.label.textContent = hiddenAt === null ? 'Siguiendo el objeto…' : 'Objeto tapado: buscándolo…';
+      hud.fill.style.width = `${Math.round(((mt - ts0) / (tsEnd - ts0)) * 100)}%`;
+      setPlayhead(clamp(A.tsToTimeline(clip, mt), clip.start, M.clipEnd(clip) - M.frameDur(p)));
+      touch();
+    };
 
     beginTxn('Seguir objeto');
     started = true;
@@ -272,21 +338,47 @@ export async function trackCensor(clip, region) {
     const process = (mt) => {
       const dt = mt - lastT;
       if (dt <= 1e-4) return true;
-      const k = tw / cur.w; // píxeles de análisis por píxel de video
-      const px = cur.x + vel.x * dt;
-      const py = cur.y + vel.y * dt;
-      const S = sample(px - cur.w / 2 - R / k, py - cur.h / 2 - R / k, sw / k, sh / k, sw, sh);
-      const m = search(T, tw, th, S, sw, sh);
-      if (m.score < 0.3) {
-        lost++;
+      const hidden = hiddenAt !== null;
+      const px = clamp(cur.x + vel.x * dt, 0, vw);
+      const py = clamp(cur.y + vel.y * dt, 0, vh);
+      // Mientras está tapado se busca en una zona cada vez más amplia.
+      const m = locate(px, py, hidden ? Math.round(R * (2 + Math.min(1.5, (mt - hiddenAt) * 1.5))) : R);
+      // Un salto brusco con un parecido solo regular suele ser otra cosa que pasa por delante.
+      const lim = limits(typical || m.score);
+      const jump = Math.hypot(m.x - px, m.y - py);
+      const gate = (0.35 * Math.min(cur.w, cur.h) + 3) * (m.score >= lim.learn ? 1 : 0.5) + 0.3 * Math.hypot(vel.x, vel.y) * dt;
+      const found = hidden ? m.score >= lim.back : m.score >= lim.ok && (jump <= gate || m.score >= lim.sure);
+      if (!found) {
+        // Tapado: la zona sigue por inercia y no se guarda nada hasta volver a verlo.
+        if (!hidden) {
+          hiddenAt = lastT;
+          // Inercia con la velocidad media del último medio segundo en que se vio bien.
+          const last = samples[samples.length - 1];
+          let ref = samples[0];
+          for (const s of samples) if (s.t <= last.t - 0.5) ref = s;
+          const span = last.t - ref.t;
+          vel = span > 0.1 ? { x: ((last.x - ref.x) * vw) / span, y: ((last.y - ref.y) * vh) / span } : { x: 0, y: 0 };
+        }
+        cur.x = px;
+        cur.y = py;
         lastT = mt;
-        return lost < 5;
+        progress(mt);
+        if (mt - hiddenAt > MAX_HIDDEN) {
+          gaveUp = true;
+          return false;
+        }
+        return true;
       }
-      lost = 0;
-      let nx = px - cur.w / 2 - R / k + (m.ox + tw / 2) / k;
-      let ny = py - cur.h / 2 - R / k + (m.oy + th / 2) / k;
-      nx = clamp(nx, 0, vw);
-      ny = clamp(ny, 0, vh);
+      const nx = clamp(m.x, 0, vw);
+      const ny = clamp(m.y, 0, vh);
+      if (hidden) {
+        // Reencontrado: la velocidad se recalcula con el tramo completo que estuvo oculto.
+        hiddenAt = null;
+        const span = Math.max(mt - seen.t, 1e-3);
+        vel = { x: (nx - seen.x) / span, y: (ny - seen.y) / span };
+        cur.x = nx - vel.x * dt;
+        cur.y = ny - vel.y * dt;
+      }
 
       // ¿El objeto se acerca o se aleja? Prueba un tamaño algo mayor y algo menor.
       let bestPatch = patchAt(nx, ny, cur.w, cur.h);
@@ -311,21 +403,20 @@ export async function trackCensor(clip, region) {
       cur.y = ny;
       lastT = mt;
 
-      if (bestScore > 0.55) {
-        for (let i = 0; i < T.length; i++) T[i] = T[i] * 0.88 + bestPatch.a[i] * 0.1 + T0[i] * 0.02;
+      seen = { t: mt, x: nx, y: ny };
+      typical = typical ? typical * 0.9 + m.score * 0.1 : m.score;
+
+      // El aspecto se actualiza poco a poco y solo cuando se ve con claridad, para no acabar
+      // siguiendo a lo que lo tapa.
+      if (bestScore > lim.learn) {
+        for (let i = 0; i < T.length; i++) T[i] = T[i] * 0.88 + bestPatch.a[i] * 0.09 + T0[i] * 0.03;
         normalize(T);
       }
 
       const smp = { t: mt, x: cur.x / vw, y: cur.y / vh, w: cur.w / vw, h: cur.h / vh };
       samples.push(smp);
       for (const key of PROPS) setKey(region, key, mt, smp[key], { e: 'linear' });
-      const now = performance.now();
-      if (now - lastUi > 110) {
-        lastUi = now;
-        hud.fill.style.width = `${Math.round(((mt - ts0) / (tsEnd - ts0)) * 100)}%`;
-        setPlayhead(clamp(A.tsToTimeline(clip, mt), clip.start, M.clipEnd(clip) - M.frameDur(p)));
-        touch();
-      }
+      progress(mt);
       return true;
     };
 
@@ -350,7 +441,10 @@ export async function trackCensor(clip, region) {
           lastCb = performance.now();
           const mt = meta.mediaTime;
           if (j.cancelled || mt >= tsEnd - 1e-3) return finish();
-          if (mt > lastT + 1e-4 && !process(mt)) return finish();
+          if (mt > lastT + 1e-4) {
+            grab();
+            if (!process(mt)) return finish();
+          }
           el.requestVideoFrameCallback(onFrame);
           return undefined;
         };
@@ -368,26 +462,31 @@ export async function trackCensor(clip, region) {
     } else stalled = true;
 
     // Plan B: avanzar a saltos si el reproductor no entrega fotogramas.
-    if (stalled && !j.cancelled && lost < 5 && lastT < tsEnd - 0.2) {
+    if (stalled && !j.cancelled && !gaveUp && lastT < tsEnd - 0.2) {
       const stepT = 1 / Math.min(media.fps || 30, 15);
       for (let t = lastT + stepT; t < tsEnd && !j.cancelled; t += stepT) {
         el.currentTime = t;
         if (!(await once(el, 'seeked', 5000))) break;
+        grab();
         if (!process(t)) break;
       }
     }
 
-    // Suaviza la trayectoria y deja solo los keyframes necesarios.
+    // Suaviza la trayectoria y deja solo los keyframes necesarios. Si terminó con el objeto
+    // tapado, el seguimiento llega hasta la última vez que se vio.
+    const endT = samples[samples.length - 1].t;
     const final = simplify(smooth(samples), 0.0035);
-    for (const k of PROPS) region.kf[k] = (region.kf[k] || []).filter((key) => key.t < ts0 - 1e-4 || key.t > lastT + 1e-4);
+    for (const k of PROPS) region.kf[k] = (region.kf[k] || []).filter((key) => key.t < ts0 - 1e-4 || key.t > endT + 1e-4);
     for (const s of final) for (const k of PROPS) setKey(region, k, s.t, s[k], { e: 'linear' });
     touch();
     endTxn();
     started = false;
-    setPlayhead(clamp(A.tsToTimeline(clip, lastT), clip.start, M.clipEnd(clip) - M.frameDur(p)));
+    const stopAt = clamp(A.tsToTimeline(clip, endT), clip.start, M.clipEnd(clip) - M.frameDur(p));
+    setPlayhead(stopAt);
 
-    if (lost >= 5) message = ['Se perdió el objeto. Recoloca la zona y pulsa de nuevo "Seguir objeto" para continuar desde ahí.', 'info'];
-    else if (j.cancelled) message = ['Seguimiento detenido. Se conservan los keyframes creados.', 'info'];
+    if (gaveUp || (hiddenAt !== null && !j.cancelled)) {
+      message = [`El objeto dejó de verse en ${formatTC(stopAt, p.settings.fps)}. El seguimiento llega hasta ahí: si reaparece, recoloca la zona y pulsa de nuevo «Seguir objeto».`, 'info', { duration: 9000 }];
+    } else if (j.cancelled) message = ['Seguimiento detenido. Se conservan los keyframes creados.', 'info'];
     else message = [`Seguimiento completado: ${final.length} keyframes`, 'ok'];
   } catch (e) {
     if (started) cancelTxn();
@@ -404,5 +503,5 @@ export async function trackCensor(clip, region) {
     job = null;
     setUI({ tracking: false });
   }
-  if (message) toast(message[0], message[1]);
+  if (message) toast(message[0], message[1], message[2]);
 }

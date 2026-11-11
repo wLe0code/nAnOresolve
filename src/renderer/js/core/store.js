@@ -37,7 +37,7 @@ export const state = {
   pxPerSec: 60,
   scrollX: 0,
 
-  viewerMode: null, // null | 'censor' | 'record'
+  viewerMode: null, // null | 'censor' | 'crop' | 'record'
   censorMode: 'pixelate', // modo por defecto al dibujar una censura
   censorShape: 'rect',
   activeCensor: null, // id de la región de censura seleccionada

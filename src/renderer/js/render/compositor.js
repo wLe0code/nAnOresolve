@@ -1,7 +1,7 @@
 // Compositor WebGL2: dibuja una escena (capas, efectos, color, censura y transiciones).
 // La vista previa lo usa sobre el lienzo visible y la exportación sobre un framebuffer.
 
-import { VERT_LAYER, FRAG_LAYER, VERT_QUAD, FRAG_TRANSITION, MAX_CENSORS } from './shaders.js';
+import { VERT_LAYER, FRAG_LAYER, VERT_QUAD, FRAG_TRANSITION, FRAG_YUV_IN, FRAG_NV12_OUT, MAX_CENSORS } from './shaders.js';
 import { mat, hexToRgb, clamp } from '../core/util.js';
 import { layerMatrix } from './scene.js';
 import { renderText } from './textrender.js';
@@ -34,6 +34,13 @@ function makeProgram(gl, vs, fs) {
   }
   return { prog, u };
 }
+
+// Coeficientes YUV -> RGB por matriz de color: [Cr->R, Cb->G, Cr->G, Cb->B].
+export const YUV_COEF = {
+  bt709: [1.5748, 0.1873, 0.4681, 1.8556],
+  bt601: [1.402, 0.344136, 0.714136, 1.772],
+  bt2020: [1.4746, 0.16455, 0.57135, 1.8814],
+};
 
 const quantizeScale = (s) => clamp(Math.pow(2, Math.ceil(Math.log2(Math.max(s, 0.01)) * 2) / 2), 0.25, 8);
 
@@ -209,6 +216,8 @@ export class Compositor {
     gl.uniform2f(u.uUnit, minSide / src.w, minSide / src.h);
     gl.uniform2f(u.uRef, minSide / src.w / 1080, minSide / src.h / 1080);
     gl.uniform1f(u.uOpacity, layer.opacity);
+    const crop = layer.crop || [0, 0, 0, 0];
+    gl.uniform4f(u.uCrop, crop[0], crop[1], crop[2], crop[3]);
     gl.uniform1f(u.uStraight, src.straight ? 1 : 0);
     gl.uniform1f(u.uTime, layer.ts);
 
@@ -273,7 +282,9 @@ export class Compositor {
       const gl = this.gl;
       gl.bindTexture(gl.TEXTURE_2D, e.tex);
       try {
-        if (s.data) {
+        if (s.data && s.yuv) {
+          this.uploadYuv(e, s);
+        } else if (s.data) {
           gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
           if (s.channels === 3) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB8, s.width, s.height, 0, gl.RGB, gl.UNSIGNED_BYTE, s.data);
           else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, s.width, s.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, s.data);
@@ -321,6 +332,135 @@ export class Compositor {
     return e;
   }
 
+  // ---------------------------------------------------- YUV (exportación) ----
+
+  yuvPrograms() {
+    if (!this.yuvIn) {
+      const gl = this.gl;
+      this.yuvIn = makeProgram(gl, VERT_QUAD, FRAG_YUV_IN);
+      this.nv12Out = makeProgram(gl, VERT_QUAD, FRAG_NV12_OUT);
+      this.scratchFbo = gl.createFramebuffer();
+      const plane = () => {
+        const t = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, t);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        return t;
+      };
+      this.planeY = plane();
+      this.planeUV = plane();
+    }
+  }
+
+  /** Convierte un fotograma NV12 (ancho y alto pares) en la textura RGBA `e.tex`. */
+  uploadYuv(e, s) {
+    const gl = this.gl;
+    this.yuvPrograms();
+    const w = s.width;
+    const h = s.height;
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.planeUV);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, w / 2, h / 2, 0, gl.RG, gl.UNSIGNED_BYTE, s.data, w * h);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.planeY);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, s.data, 0);
+
+    if (e.w !== w || e.h !== h || !e.rgba) {
+      gl.bindTexture(gl.TEXTURE_2D, e.tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      e.rgba = true;
+      gl.bindTexture(gl.TEXTURE_2D, this.planeY);
+    }
+    const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+    const prevView = gl.getParameter(gl.VIEWPORT);
+    const blend = gl.isEnabled(gl.BLEND);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, e.tex, 0);
+    gl.viewport(0, 0, w, h);
+    gl.disable(gl.BLEND);
+    const p = this.yuvIn;
+    gl.useProgram(p.prog);
+    gl.uniform1i(p.u.uY, 0);
+    gl.uniform1i(p.u.uUV, 1);
+    gl.uniform4fv(p.u.uCoef, YUV_COEF[s.yuv] || YUV_COEF.bt709);
+    gl.uniform1f(p.u.uChromaShift, 0.5 / w);
+    gl.uniform1f(p.u.uFlip, 1);
+    gl.bindVertexArray(this.vao);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo);
+    gl.viewport(prevView[0], prevView[1], prevView[2], prevView[3]);
+    if (blend) gl.enable(gl.BLEND);
+    gl.bindTexture(gl.TEXTURE_2D, e.tex);
+  }
+
+  packTarget(w, h) {
+    const gl = this.gl;
+    let t = this.pack;
+    if (!t) {
+      t = this.pack = { fbo: gl.createFramebuffer(), tex: gl.createTexture(), w: 0, h: 0 };
+      gl.bindTexture(gl.TEXTURE_2D, t.tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    }
+    if (t.w !== w || t.h !== h) {
+      gl.bindTexture(gl.TEXTURE_2D, t.tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t.tex, 0);
+      t.w = w;
+      t.h = h;
+    }
+    return t;
+  }
+
+  /** ¿Puede esta tarjeta entregar el fotograma final ya convertido a NV12? */
+  supportsNV12() {
+    if (this.nv12Ok === undefined) {
+      const gl = this.gl;
+      try {
+        this.yuvPrograms();
+        const t = this.packTarget(4, 6);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
+        this.nv12Ok =
+          gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE &&
+          gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT) === gl.RED &&
+          gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE) === gl.UNSIGNED_BYTE;
+      } catch {
+        this.nv12Ok = false;
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+    return this.nv12Ok;
+  }
+
+  /** Lee un framebuffer ya compuesto como NV12 (ancho × alto × 1,5 bytes, filas de arriba abajo). */
+  readNV12(name, out) {
+    const gl = this.gl;
+    const f = this.fbos.get(name);
+    if (!f) return null;
+    const t = this.packTarget(f.w, f.h + f.h / 2);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
+    gl.viewport(0, 0, t.w, t.h);
+    gl.disable(gl.BLEND);
+    const p = this.nv12Out;
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, f.tex);
+    gl.uniform1i(p.u.uSrc, 0);
+    gl.uniform1i(p.u.uH, f.h);
+    gl.uniform1f(p.u.uFlip, 1);
+    gl.bindVertexArray(this.vao);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.readPixels(0, 0, t.w, t.h, gl.RED, gl.UNSIGNED_BYTE, out);
+    gl.enable(gl.BLEND);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return out;
+  }
+
   /** Lee el contenido de un framebuffer (RGBA, filas de arriba abajo). */
   readFbo(name, out) {
     const gl = this.gl;
@@ -354,6 +494,15 @@ export class Compositor {
       gl.deleteTexture(f.tex);
     }
     this.fbos.clear();
+    if (this.pack) {
+      gl.deleteFramebuffer(this.pack.fbo);
+      gl.deleteTexture(this.pack.tex);
+    }
+    if (this.scratchFbo) {
+      gl.deleteFramebuffer(this.scratchFbo);
+      gl.deleteTexture(this.planeY);
+      gl.deleteTexture(this.planeUV);
+    }
     const ext = gl.getExtension('WEBGL_lose_context');
     if (ext) ext.loseContext();
   }

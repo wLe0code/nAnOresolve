@@ -1,7 +1,7 @@
 # nAnOresolve
 
 Editor de video de escritorio, sencillo y rápido de aprender, inspirado en el flujo de trabajo de
-DaVinci Resolve y Filmora. **Versión Beta 1.0.**
+DaVinci Resolve y Filmora. **Versión Beta 1.1.**
 
 Abre prácticamente cualquier formato de video, audio o imagen (lo que FFmpeg sepa leer) y exporta
 siempre a partir de los archivos originales, a máxima calidad.
@@ -18,11 +18,15 @@ siempre a partir de los archivos originales, a máxima calidad.
 | 🧲 | **Imán** | Botón del imán (`N`): la cuchilla se pega al cursor y a los cortes cercanos; los clips se pegan entre sí al moverlos o recortarlos. |
 | ◆ | **Keyframes** | En el inspector, pulsa ◆ junto a posición, escala, rotación, opacidad, volumen o cantidad de un efecto. Los rombos aparecen sobre el clip y se pueden arrastrar. |
 | 🎨 | **Color y plantillas** | Área de trabajo *Color*: plantillas con vista previa en vivo (blanco y negro, amarillo desierto al estilo *Breaking Bad*, teal & orange, vintage…) e intensidad y ajuste fino. |
-| ▦ | **Censura** | Botón **Censurar**: dibuja un recuadro sobre la placa, el rostro o el documento. Pixelado por defecto o difuminado. **Seguir objeto** mueve la zona automáticamente para que acompañe a lo que tapa. |
+| ▦ | **Censura** | Botón **Censurar**: dibuja un recuadro sobre la placa, el rostro o el documento. Pixelado por defecto o difuminado. **Seguir objeto** mueve la zona automáticamente para que acompañe a lo que tapa; si algo lo tapa un momento, sigue por inercia y lo vuelve a encontrar. |
+| ⏩ | **Velocidad** | Botón **Velocidad**: cámara lenta o rápida de 0,1× a 10× con el control, los botones (0,25× … 4×) o escribiendo la duración que quieres. Puedes mantener el tono de las voces o dejar que cambie. El clip se acorta o se alarga solo y lo que sigue se recorre. |
+| 🎞️ | **Configuración del video** | Botón con la resolución en la barra superior, `Ctrl+K` o *Archivo → Configuración del video*: horizontal, vertical (TikTok, Reels), cuadrado, 4:5 o tamaño personalizado, de 480p a 4K, y fotogramas por segundo (23,976 a 60 o cualquier valor de 1 a 120). Los clips se adaptan solos y, al cambiar de forma, los videos pueden ampliarse para llenar el cuadro. |
+| ⬚ | **Recorte de imagen** | Botón **Recorte**: arrastra los bordes en el visor o elige una proporción (16:9, 9:16, 1:1…). «Rellenar el cuadro» amplía lo que queda, por ejemplo para pasar un video horizontal a vertical. Cada borde se puede animar con keyframes. |
 
 Además: deshacer/rehacer, varias pistas de video y audio, imágenes y logos, separar audio,
 autoguardado con recuperación, y exportación a MP4 (H.264 / H.265), MOV ProRes, MKV, WebM, AVI,
-MP3 y WAV.
+MP3 y WAV. Al exportar puedes elegir que el video lo codifique la tarjeta gráfica (NVIDIA, Intel o
+AMD) si el equipo tiene una compatible.
 
 ## Instalación
 
@@ -60,6 +64,7 @@ npm run package
 | `Ctrl+Z` `Ctrl+Y` | Deshacer / rehacer |
 | `+` `−` `Mayús+Z` | Zoom de la línea temporal / verla entera |
 | `Ctrl+S` `Ctrl+I` `Ctrl+E` | Guardar, importar, exportar |
+| `Ctrl+K` | Configuración del video (resolución y fps) |
 
 ## Cómo funciona por dentro
 
@@ -68,10 +73,17 @@ npm run package
   WebGL (`src/renderer/js/render`): color, zoom, censura, texto y transiciones se dibujan con los
   mismos shaders. Al exportar, FFmpeg decodifica los originales a fotogramas sin comprimir, el
   compositor los procesa y FFmpeg codifica el resultado.
+- **Exportación rápida.** Los fotogramas viajan entre FFmpeg y el compositor en YUV 4:2:0 y la
+  conversión de color la hace la tarjeta gráfica. En el equipo de pruebas, 1080p se exporta a unos
+  40 fotogramas por segundo y 4K a unos 28.
 - **Proxys automáticos.** Si un archivo no puede reproducirse directamente (HEVC con AC-3, ProRes,
-  AVI, WMV…), se crea una copia ligera solo para la vista previa. La exportación siempre lee el
-  original.
+  AVI, WMV…), se crea una copia ligera solo para la vista previa. Si la imagen sí se reproduce y
+  solo falla el audio (por ejemplo, sonido 5.1), la copia convierte únicamente el audio y está
+  lista en segundos. La exportación siempre lee el original.
 - **Audio.** La mezcla usa las mismas cadenas en la vista previa y en la exportación (Web Audio).
+  El sonido envolvente se pasa a estéreo igual en ambos casos.
+- **HDR.** El video HDR se convierte a color estándar; con clic derecho sobre el archivo →
+  *Ajustes de HDR* se elige la curva y el brillo, y la exportación usa los mismos ajustes.
 
 ```
 src/main        proceso principal: ventana, diálogos, FFmpeg (análisis, proxys, exportación)
@@ -80,15 +92,15 @@ src/renderer    interfaz: línea temporal, visor, inspector, compositor, grabaci
 scripts         pruebas de humo que manejan la app real (npm run test:smoke)
 ```
 
-## Limitaciones conocidas de la Beta 1.0
+## Limitaciones conocidas
 
-- No hay cambio de velocidad de los clips ni recorte (crop) de la imagen.
-- La exportación va aproximadamente a tiempo real en 1080p; todavía no usa la GPU para codificar.
-- El seguimiento automático de la censura funciona mejor con objetos con detalle (bordes, letras)
-  y puede perderse si quedan tapados; en ese caso recoloca la zona y vuelve a pulsar *Seguir objeto*.
-- El audio con más de dos canales (5.1) puede sonar con un nivel ligeramente distinto entre la
-  vista previa y el archivo exportado.
-- El video HDR se convierte a SDR con una curva estándar; no hay controles para ajustarla.
+- La velocidad es constante en cada clip: no hay rampas de velocidad ni reproducción hacia atrás.
+- El seguimiento automático de la censura funciona mejor con objetos con detalle (bordes, letras).
+  Si el objeto queda tapado más de un segundo, el seguimiento se detiene ahí y avisa: recoloca la
+  zona donde reaparezca y vuelve a pulsar *Seguir objeto*.
+- La codificación por tarjeta gráfica solo se ha probado con AMD; con NVIDIA, Intel y Apple se
+  comprueba al exportar que funciona y, si no, se usa el procesador.
+- La exportación en ProRes no usa la ruta rápida (conserva más detalle de color) y es más lenta.
 - Probado en Windows 11. En macOS y Linux debería funcionar, pero no se ha comprobado.
 
 ## Licencia

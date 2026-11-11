@@ -1,10 +1,10 @@
 // Motor de vista previa: reloj de reproducción, elementos de video/audio sincronizados con la
 // línea temporal, mezcla de audio en tiempo real y dibujo de cada fotograma con el compositor.
 
-import { state, on, emit, setPlayhead } from '../core/store.js';
+import { state, on, emit, setPlayhead, primaryClip } from '../core/store.js';
 import { clamp } from '../core/util.js';
-import { mediaById, trackById, projectDuration, mediaWindow, audioGainAt, clipHasAudio, sourceTime, snapFrame } from '../core/model.js';
-import { buildScene } from '../render/scene.js';
+import { mediaById, trackById, projectDuration, mediaWindow, audioGainAt, clipHasAudio, sourceTime, snapFrame, speedOf } from '../core/model.js';
+import { buildScene, sceneLayers } from '../render/scene.js';
 import { Compositor } from '../render/compositor.js';
 import { rt, previewUrl } from '../media/library.js';
 import { buildFx, buildMaster } from './audiograph.js';
@@ -47,6 +47,25 @@ class Engine {
       this.requestRender();
     });
     on('media', () => this.requestRender());
+    // La vista previa de un medio cambió de archivo: sus elementos se vuelven a crear.
+    on('media-reload', (id) => {
+      for (const [clipId, slot] of [...this.slots]) {
+        if (slot.mediaId === id) {
+          this.slots.delete(clipId);
+          this.destroy(slot);
+        }
+      }
+      this.pool = this.pool.filter((slot) => {
+        if (slot.mediaId !== id) return true;
+        this.destroy(slot);
+        return false;
+      });
+      this.requestRender();
+    });
+    on('ui', (keys) => {
+      if (keys.includes('viewerMode')) this.requestRender();
+    });
+    on('selection', () => this.requestRender());
     this.requestRender();
   }
 
@@ -133,6 +152,11 @@ class Engine {
     }
     this.sync(t);
     this.scene = buildScene(state.project, t);
+    // Mientras se ajusta el recorte en el visor, el clip se ve entero (el visor oscurece lo que sobra).
+    if (state.viewerMode === 'crop' && !this.playing) {
+      const sel = primaryClip();
+      if (sel) for (const layer of sceneLayers(this.scene)) if (layer.clip.id === sel.id) layer.crop = [0, 0, 0, 0];
+    }
     this.compositor.render(this.scene, this);
     emit('frame', this.scene);
     if (this.playing) this.raf = requestAnimationFrame(this.tick);
@@ -345,14 +369,21 @@ class Engine {
     const project = state.project;
     if (slot.node && slot.fxId !== (clip.audioFx || null)) this.rewire(slot, clip.audioFx || null);
 
+    // Velocidad del clip: el elemento reproduce más rápido o más lento, con o sin corrección de tono.
+    const speed = clamp(speedOf(clip), 0.0625, 16);
+    if (el.playbackRate !== speed) el.playbackRate = speed;
+    const keepPitch = clip.pitch !== false;
+    if (el.preservesPitch !== keepPitch) el.preservesPitch = keepPitch;
+
     const maxT = Math.max(0, media.duration - 0.02);
     const target = clamp(n.ts, 0, maxT);
     const canPlay = playing && n.active && n.ts >= -1e-3 && n.ts < media.duration - 0.02;
     if (canPlay) {
-      const diff = Math.abs(el.currentTime - target);
+      // Desfase medido en segundos de línea temporal (el tiempo de origen corre `speed` veces más rápido).
+      const diff = Math.abs(el.currentTime - target) / speed;
       const now = performance.now();
       // Al buscar se apunta un poco por delante: lo que tarda de media ese elemento en reposicionarse.
-      const ahead = Math.min(target + (slot.seekCost || 0.04), maxT);
+      const ahead = Math.min(target + (slot.seekCost || 0.04) * speed, maxT);
       if (el.paused) {
         if (slot.seeking) {
           /* se reproducirá en cuanto termine de reposicionarse */
@@ -363,6 +394,7 @@ class Engine {
           slot.tries = 0;
           el.play().catch(() => {});
         }
+        slot.parkedAt = null;
       } else if (diff > 0.2 && !slot.seeking && now - slot.resyncAt > 500) {
         slot.resyncAt = now;
         this.seekSlot(slot, ahead, 0);
@@ -371,7 +403,16 @@ class Engine {
     } else {
       slot.tries = 0;
       if (!el.paused) el.pause();
-      this.seekSlot(slot, target, playing ? 0.05 : 0.5 / (media.fps || 30));
+      // En pausa se apunta al centro del fotograma del proyecto: así se ve el mismo fotograma de
+      // origen que elegirá la exportación (el más cercano), aunque el archivo tenga otra cadencia,
+      // otra velocidad o marcas de tiempo redondeadas a milisegundos (MKV, WebM).
+      const bias = playing ? 0 : Math.max(0, (0.5 * speed) / project.settings.fps - 2e-4);
+      const goal = Math.min(target + bias, maxT);
+      // La primera vez que se detiene en un punto se reposiciona con exactitud (al pausar, el
+      // elemento puede haber quedado un fotograma más allá); después basta con no haberse movido.
+      const tol = playing ? 0.05 : slot.parkedAt === goal ? 0.45 / (media.fps || 30) : 0.002;
+      this.seekSlot(slot, goal, tol);
+      slot.parkedAt = playing ? null : goal;
     }
 
     if (slot.gain) {

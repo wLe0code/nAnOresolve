@@ -1,7 +1,7 @@
 {
   "name": "nanoresolve",
   "productName": "nAnOresolve",
-  "version": "1.0.0-beta.1",
+  "version": "1.1.0-beta.1",
   "description": "Editor de video de escritorio: cortes, voz en off, efectos, transiciones, zoom, textos, keyframes, color y censura.",
   "main": "src/main/main.js",
   "author": "Leo",

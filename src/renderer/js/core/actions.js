@@ -3,25 +3,29 @@
 import { state, mutate, select, setUI, setPlayhead, removedMedia, selectedClips } from './store.js';
 import * as M from './model.js';
 import { clamp, deepClone, EPS } from './util.js';
-import { setProp, setKey, hasKeys, toggleKey, clearKeys, neighborKey } from './keyframes.js';
+import { evalProp, setProp, setKey, hasKeys, toggleKey, clearKeys, neighborKey } from './keyframes.js';
 import { colorFromPreset, COLOR_DEFAULT, effectById, TEXT_PRESETS, DEFAULT_TRANSITION_DURATION, FRAME_RATES } from './presets.js';
 import { MAX_CENSORS } from '../render/shaders.js';
+import { baseSize } from '../render/scene.js';
 import { toast } from '../ui/widgets.js';
 
 /** Tiempo de origen del clip bajo el cursor (limitado al tramo visible del clip). */
 export function clipTs(clip, t = state.playhead) {
-  return clamp(M.sourceTime(clip, t), clip.in, clip.in + clip.duration);
+  return clamp(M.sourceTime(clip, t), clip.in, M.sourceEnd(clip));
 }
 
-export const tsToTimeline = (clip, ts) => clip.start + (ts - clip.in);
+export const tsToTimeline = (clip, ts) => M.timelineTime(clip, ts);
 
 const isLocked = (p, clip) => !!M.trackById(p, clip.trackId)?.locked;
 const fpsLabel = (fps) => (Number.isInteger(fps) ? String(fps) : fps.toFixed(3).replace(/0+$/, ''));
 
 function matchProject(p, media) {
   const even = (n) => Math.max(2, Math.round(n / 2) * 2);
+  const oldW = p.settings.width;
+  const oldH = p.settings.height;
   p.settings.width = even(media.width);
   p.settings.height = even(media.height);
+  rescaleClips(p, oldW, oldH); // por si ya había textos colocados
   const raw = media.fps || 30;
   p.settings.fps = FRAME_RATES.find((r) => Math.abs(r - raw) < 0.02) || clamp(Math.round(raw * 1000) / 1000, 1, 120);
   p.settings.matched = true;
@@ -226,6 +230,8 @@ export function detachAudio(clip) {
       audioFadeOut: clip.audioFadeOut,
       audioFx: clip.audioFx,
       audioTransIn: null,
+      speed: M.speedOf(clip),
+      pitch: clip.pitch !== false,
       kf: clip.kf.volume ? { volume: deepClone(clip.kf.volume) } : {},
     };
     clip.audioDetached = true;
@@ -284,6 +290,124 @@ export function setClipField(clip, field, value, label = 'Ajustar') {
   mutate(label, () => {
     clip[field] = value;
   }, { coalesce: `${clip.id}:${field}` });
+}
+
+// --------------------------------------------------------------- velocidad ----
+
+// Recuerda el material exacto que ocupaba el clip para que arrastrar el control no acumule
+// errores de redondeo a fotogramas.
+let speedMemo = null;
+let speedWarnAt = 0;
+
+/**
+ * Cambia la velocidad de un clip. El clip sigue mostrando el mismo material, así que su
+ * duración se adapta: en la pista principal (con "cerrar huecos") lo que sigue se recorre;
+ * en el resto, si no cabe, se recorta el final.
+ */
+export function setClipSpeed(clip, speed) {
+  if (!('speed' in clip) || !(speed > 0)) return;
+  speed = clamp(Math.round(speed * 1000) / 1000, M.MIN_SPEED, M.MAX_SPEED);
+  const skipped = new Set();
+  let cut = false;
+  mutate('Velocidad', (p) => {
+    const fd = M.frameDur(p);
+    const old = M.speedOf(clip);
+    const known = speedMemo && speedMemo.id === clip.id && speedMemo.speed === old && Math.abs(speedMemo.duration - clip.duration) < EPS;
+    let span = known ? speedMemo.span : clip.duration * old;
+    const oldEnd = M.clipEnd(clip);
+    let duration = Math.max(fd, M.snapFrame(p, span / speed));
+    const main = M.mainTrack(p);
+    const ripple = state.ripple && main && clip.trackId === main.id;
+    const except = new Set([clip.id]);
+    if (!ripple) {
+      const next = M.trackClips(p, clip.trackId, except).find((c) => c.start >= oldEnd - EPS);
+      if (next && clip.start + duration > next.start + EPS) {
+        duration = Math.max(fd, M.snapFrame(p, next.start - clip.start));
+        span = duration * speed;
+        cut = true;
+      }
+    }
+    clip.speed = speed;
+    clip.duration = duration;
+    for (const k of ['fadeIn', 'fadeOut', 'audioFadeIn', 'audioFadeOut']) if (clip[k] > duration) clip[k] = duration;
+    if (ripple) for (const t of M.rippleShift(p, oldEnd, clip.start + duration - oldEnd, { except })) skipped.add(t.name);
+    speedMemo = { id: clip.id, speed, duration, span };
+  }, { coalesce: `${clip.id}:speed` });
+  if ((cut || skipped.size) && performance.now() - speedWarnAt > 5000) {
+    speedWarnAt = performance.now();
+    toast(cut ? 'No hay hueco para alargar el clip: se recortó su final. Mueve el clip siguiente si lo necesitas entero.' : `No se recorrió ${[...skipped].join(', ')}: un clip cruza el corte`);
+  }
+}
+
+/** Ajusta la velocidad para que el clip dure exactamente `duration` segundos. */
+export function setClipDuration(clip, duration) {
+  if (!('speed' in clip) || !(duration > 0)) return;
+  const known = speedMemo && speedMemo.id === clip.id && speedMemo.speed === M.speedOf(clip) && Math.abs(speedMemo.duration - clip.duration) < EPS;
+  const span = known ? speedMemo.span : M.sourceSpan(clip);
+  setClipSpeed(clip, span / duration);
+}
+
+// ------------------------------------------------------------------ recorte ----
+
+const CROP_OPPOSITE = { cropL: 'cropR', cropR: 'cropL', cropT: 'cropB', cropB: 'cropT' };
+
+/** Valores de recorte de un clip en el cursor: { cropL, cropT, cropR, cropB }. */
+export function cropAt(clip, ts = clipTs(clip)) {
+  const out = {};
+  for (const k of M.CROP_PROPS) out[k] = clamp(evalProp(clip, k, ts) || 0, 0, M.MAX_CROP);
+  return out;
+}
+
+export const hasCrop = (clip) => M.CROP_PROPS.some((k) => clip[k] > 0 || hasKeys(clip, k));
+
+/** Escribe uno o varios bordes del recorte (respeta los keyframes). No abre paso de deshacer propio. */
+export function writeCrop(clip, values) {
+  const ts = clipTs(clip);
+  for (const [k, v] of Object.entries(values)) {
+    const opp = CROP_OPPOSITE[k];
+    const other = clamp((opp in values ? values[opp] : evalProp(clip, opp, ts)) || 0, 0, M.MAX_CROP);
+    setProp(clip, k, ts, Math.round(clamp(v, 0, M.MAX_CROP - other) * 10000) / 10000);
+  }
+}
+
+export function setCrop(clip, prop, value) {
+  mutate('Recorte', () => writeCrop(clip, { [prop]: value }), { coalesce: `${clip.id}:${prop}` });
+}
+
+export function resetCrop(clip) {
+  mutate('Quitar recorte', () => {
+    for (const k of M.CROP_PROPS) {
+      if (clip.kf) delete clip.kf[k];
+      clip[k] = 0;
+    }
+  });
+}
+
+/** Entra en el modo de recorte del visor para un clip de video o imagen. */
+export function startCrop(clip) {
+  if (!clip || (clip.type !== 'video' && clip.type !== 'image')) return false;
+  select(clip.id);
+  const fd = M.frameDur(state.project);
+  if (state.playhead < clip.start || state.playhead > M.clipEnd(clip) - fd) setPlayhead(clip.start);
+  setUI({ viewerMode: 'crop', activeCensor: null, activeZoom: null });
+  return true;
+}
+
+/**
+ * Recorta de forma centrada a una proporción (ancho / alto). `mediaAspect` es la proporción
+ * de la imagen completa.
+ */
+export function cropToAspect(clip, ratio, mediaAspect) {
+  mutate('Recorte', () => {
+    for (const k of M.CROP_PROPS) if (clip.kf) delete clip.kf[k];
+    let side = 0;
+    let vert = 0;
+    if (ratio < mediaAspect) side = (1 - ratio / mediaAspect) / 2;
+    else vert = (1 - mediaAspect / ratio) / 2;
+    const r = (v) => Math.round(v * 10000) / 10000;
+    clip.cropL = clip.cropR = r(side);
+    clip.cropT = clip.cropB = r(vert);
+  });
 }
 
 export function toggleKeyframe(obj, prop, clip, e = 'ease') {
@@ -397,10 +521,12 @@ export function setColorParam(clip, key, value) {
 export function addZoom(clip, extra = {}) {
   if (!clip.zooms) return null;
   const zoom = mutate('Añadir zoom', () => {
-    const srcEnd = clip.in + clip.duration;
+    // El zoom se guarda en tiempo de origen: 2,5 s de línea temporal son 2,5 × velocidad de material.
+    const k = M.speedOf(clip);
+    const srcEnd = M.sourceEnd(clip);
     let start = clipTs(clip);
-    let end = Math.min(start + 2.5, srcEnd);
-    if (end - start < 0.6) start = Math.max(clip.in, end - 2.5);
+    let end = Math.min(start + 2.5 * k, srcEnd);
+    if (end - start < 0.6 * k) start = Math.max(clip.in, end - 2.5 * k);
     const z = M.makeZoom(start, end, extra);
     clip.zooms.push(z);
     return z;
@@ -472,10 +598,55 @@ export function removeCensor(clip, id) {
 
 // ---------------------------------------------------------------- proyecto ----
 
-export function setProjectSettings(patch) {
+// Medidas de un texto que están en píxeles del proyecto (se reescalan con el cuadro).
+const TEXT_PX = ['size', 'strokeWidth', 'shadowBlur', 'shadowX', 'shadowY', 'bgPadding', 'spacing'];
+
+/**
+ * Adapta los clips a un cuadro de otro tamaño. Videos e imágenes ya se encajan solos en el
+ * cuadro; aquí se reescalan las posiciones (cada eje con su proporción) y las medidas de los
+ * textos (con la del encaje, como haría una imagen), para que todo quede en el mismo sitio.
+ */
+function rescaleClips(p, oldW, oldH) {
+  const { width: W, height: H } = p.settings;
+  const kx = W / oldW;
+  const ky = H / oldH;
+  const kt = Math.min(kx, ky);
+  if (Math.abs(kx - 1) < 1e-9 && Math.abs(ky - 1) < 1e-9) return;
+  const r2 = (v) => Math.round(v * 100) / 100;
+  for (const c of p.clips) {
+    if (!M.isVisual(c)) continue;
+    for (const [prop, k] of [['x', kx], ['y', ky]]) {
+      if (typeof c[prop] === 'number') c[prop] = r2(c[prop] * k);
+      if (c.kf && c.kf[prop]) for (const key of c.kf[prop]) key.v = r2(key.v * k);
+    }
+    if (c.type === 'text' && c.text) {
+      for (const prop of TEXT_PX) if (typeof c.text[prop] === 'number') c.text[prop] = r2(c.text[prop] * kt);
+      if (c.text.bgRadius < 500) c.text.bgRadius = r2(c.text.bgRadius * kt);
+    }
+  }
+}
+
+/**
+ * Cambia el formato del proyecto. Con `opts.fill`, los videos a tamaño normal se amplían para
+ * cubrir todo el cuadro (útil al pasar de horizontal a vertical o al revés).
+ */
+export function setProjectSettings(patch, opts = {}) {
   mutate('Ajustes del proyecto', (p) => {
     const oldFps = p.settings.fps;
+    const oldW = p.settings.width;
+    const oldH = p.settings.height;
     Object.assign(p.settings, patch, { matched: true });
+    if (patch.width || patch.height) {
+      rescaleClips(p, oldW, oldH);
+      if (opts.fill) {
+        const { width: W, height: H } = p.settings;
+        for (const c of p.clips) {
+          if (c.type !== 'video' || Math.abs((c.scale ?? 1) - 1) > 1e-6 || hasKeys(c, 'scale')) continue;
+          const [bw, bh] = baseSize(p, c);
+          c.scale = Math.round(Math.max(W / bw, H / bh) * 1000) / 1000;
+        }
+      }
+    }
     if (patch.fps && patch.fps !== oldFps) {
       const fd = M.frameDur(p);
       for (const c of p.clips) {

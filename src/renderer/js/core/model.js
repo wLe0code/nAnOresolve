@@ -2,7 +2,9 @@
 //
 // Convenciones:
 //  - Tiempos en segundos. `start`/`duration` de un clip están alineados a fotogramas del proyecto.
-//  - `in` es el punto de entrada dentro del medio. Tiempo de origen: ts = in + (t - start).
+//  - `in` es el punto de entrada dentro del medio. Tiempo de origen: ts = in + (t - start) × velocidad.
+//    Keyframes, zooms y censuras se guardan en tiempo de origen: siguen pegados a la imagen aunque
+//    se corte el clip o se cambie su velocidad.
 //  - project.tracks está en orden de pantalla: pistas de video de arriba abajo (la última es la
 //    principal, V1) y después las de audio.
 
@@ -10,7 +12,8 @@ import { uid, EPS, clamp, deepClone } from './util.js';
 import { evalProp } from './keyframes.js';
 import { TEXT_DEFAULT, ZOOM_DEFAULT } from './presets.js';
 
-export const PROJECT_VERSION = 1;
+// 2: velocidad por clip (el tiempo de origen depende de ella) y recorte de imagen.
+export const PROJECT_VERSION = 2;
 
 export function newProject() {
   return {
@@ -37,7 +40,18 @@ export const floorFrame = (project, t) => Math.floor(t * project.settings.fps + 
 export const clipEnd = (c) => c.start + c.duration;
 export const isVisual = (c) => c.type === 'video' || c.type === 'image' || c.type === 'text';
 export const kindOf = (clipType) => (clipType === 'audio' ? 'audio' : 'video');
-export const sourceTime = (clip, t) => clip.in + (t - clip.start);
+
+// Velocidad de reproducción de un clip de video o audio (1 = normal).
+export const MIN_SPEED = 0.1;
+export const MAX_SPEED = 10;
+export const speedOf = (clip) => (clip.speed > 0 ? clip.speed : 1);
+
+export const sourceTime = (clip, t) => clip.in + (t - clip.start) * speedOf(clip);
+/** Instante de la línea temporal en el que se ve el tiempo de origen ts. */
+export const timelineTime = (clip, ts) => clip.start + (ts - clip.in) / speedOf(clip);
+/** Segundos de material de origen que ocupa el clip. */
+export const sourceSpan = (clip) => clip.duration * speedOf(clip);
+export const sourceEnd = (clip) => clip.in + clip.duration * speedOf(clip);
 
 export const trackById = (project, id) => project.tracks.find((t) => t.id === id) || null;
 export const clipById = (project, id) => project.clips.find((c) => c.id === id) || null;
@@ -84,6 +98,11 @@ const visualProps = () => ({
   scale: 1,
   rotation: 0,
   opacity: 1,
+  // Recorte de cada borde, como fracción (0..1) del ancho o alto de la imagen.
+  cropL: 0,
+  cropT: 0,
+  cropR: 0,
+  cropB: 0,
   fadeIn: 0,
   fadeOut: 0,
   color: null,
@@ -94,7 +113,10 @@ const visualProps = () => ({
   transOut: null,
 });
 
-const audioProps = () => ({ volume: 1, muted: false, audioFadeIn: 0, audioFadeOut: 0, audioFx: null, audioTransIn: null });
+const audioProps = () => ({ volume: 1, muted: false, audioFadeIn: 0, audioFadeOut: 0, audioFx: null, audioTransIn: null, speed: 1, pitch: true });
+
+export const CROP_PROPS = ['cropL', 'cropT', 'cropR', 'cropB'];
+export const MAX_CROP = 0.98; // lo máximo que pueden recortar dos bordes opuestos entre los dos
 
 export function makeMediaClip(project, media, trackId, start) {
   const fd = frameDur(project);
@@ -234,7 +256,7 @@ export function splitClip(project, clip, t) {
   right.id = uid('c');
   renewIds(right);
   right.start = t;
-  right.in = clip.in + leftDur;
+  right.in = clip.in + leftDur * speedOf(clip);
   right.duration = clip.duration - leftDur;
   clip.duration = leftDur;
 

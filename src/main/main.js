@@ -247,10 +247,10 @@ function registerIpc() {
     return info;
   });
 
-  handle('media:proxy', async (info) => {
+  handle('media:proxy', async (info, opts) => {
     const out = await media.ensureProxy(info, cacheDir(), (progress) => {
       if (win && !win.isDestroyed()) win.webContents.send('media:proxyProgress', { path: info.path, progress });
-    });
+    }, opts || {});
     allow(out);
     return out;
   });
@@ -320,6 +320,7 @@ function registerIpc() {
     });
     return res.canceled ? null : res.filePath;
   });
+  handle('export:hwEncoders', () => exporter.hwEncoders());
   handle('export:begin', (opts) => exporter.begin(opts));
   handle('export:audioWrite', (id, bytes) => exporter.audioWrite(id, bytes));
   handle('export:startEncoder', (id) => exporter.startEncoder(id));

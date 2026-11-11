@@ -1,7 +1,7 @@
-// Inspector: propiedades del clip seleccionado (transformación, zoom, color, efectos, censura,
-// audio, transiciones y texto) con botones de keyframe en cada propiedad animable.
+// Inspector: propiedades del clip seleccionado (transformación, recorte, velocidad, zoom, color,
+// efectos, censura, audio, transiciones y texto) con botones de keyframe en cada propiedad animable.
 
-import { state, on, setUI, primaryClip, mutate, setPlayhead } from '../core/store.js';
+import { state, on, emit, setUI, primaryClip, mutate, setPlayhead } from '../core/store.js';
 import * as M from '../core/model.js';
 import * as A from '../core/actions.js';
 import { h, clear, rafThrottle, formatTC, clamp } from '../core/util.js';
@@ -11,9 +11,12 @@ import { baseSize } from '../render/scene.js';
 import { icon } from './icons.js';
 import { section, sliderRow, selectRow, colorRow, toggleRow, segmented, textAreaRow, button, contextMenu, toast } from './widgets.js';
 import { trackCensor, isTracking } from '../features/tracker.js';
+import { openVideoSettings } from './settingsui.js';
 
 const collapsed = new Map([
   ['transform', false],
+  ['crop', true],
+  ['speed', true],
   ['zoom', false],
   ['color', true],
   ['effects', true],
@@ -63,6 +66,14 @@ export class Inspector {
     on('ui', (keys) => {
       if (keys.some((k) => ['activeCensor', 'activeZoom', 'workspace', 'viewerMode', 'tracking'].includes(k))) refresh();
     });
+    // Otra parte de la interfaz pide ver una sección: se despliega y se lleva a la vista.
+    on('reveal-section', (key) => {
+      collapsed.set(key, false);
+      this.sig = null;
+      this.refresh();
+      const el = this.el.querySelector(`[data-sec="${key}"]`);
+      if (el) el.scrollIntoView({ block: 'nearest' });
+    });
     on('focus-text', () => {
       const ta = this.el.querySelector('textarea');
       if (ta) {
@@ -73,6 +84,9 @@ export class Inspector {
     this.refresh();
   }
 
+  // Importante: la firma no puede depender de valores que cambian mientras se arrastra un control
+  // (color aplicado, recorte, velocidad…). Si cambiara, el panel se reconstruiría y el arrastre se
+  // cortaría a mitad. Esas marcas se actualizan en sync().
   signature() {
     const p = state.project;
     if (!p) return 'none';
@@ -91,12 +105,11 @@ export class Inspector {
       (c.effects || []).map((e) => e.id),
       (c.censors || []).map((r) => `${r.id}${r.mode}${r.enabled}`),
       (c.zooms || []).map((z) => `${z.id}${z.mode}`),
-      !!c.color,
       c.transIn ? 1 : 0,
       c.transOut ? 1 : 0,
       c.audioTransIn ? 1 : 0,
       c.audioDetached ? 1 : 0,
-      c.text ? [c.text.bg, c.text.shadow, c.text.strokeWidth > 0] : 0,
+      c.text ? [c.text.bg, c.text.shadow] : 0,
       fontList ? fontList.length : 0,
     ]);
   }
@@ -119,12 +132,14 @@ export class Inspector {
   }
 
   sec(key, title, ico, children, opts = {}) {
-    return section(title, children, {
+    const el = section(title, children, {
       icon: ico,
       collapsed: collapsed.get(key),
       onToggle: (v) => collapsed.set(key, v),
       ...opts,
     });
+    el.dataset.sec = key;
+    return el;
   }
 
   build() {
@@ -144,12 +159,14 @@ export class Inspector {
         'div',
         { class: 'insp-head' },
         h('span', { class: `insp-type ${clip.type}`, html: icon({ video: 'film', audio: 'music', image: 'image', text: 'type' }[clip.type], 14) }),
-        h('div', { class: 'insp-title' }, h('b', { title: clip.name }, clip.name), h('span', {}, `${typeName} · ${formatTC(clip.duration, p.settings.fps)}`)),
+        h('div', { class: 'insp-title' }, h('b', { title: clip.name }, clip.name), this.add({ el: h('span', {}), sync() { this.el.textContent = `${typeName} · ${formatTC(clip.duration, p.settings.fps)}`; } })),
         state.selection.length > 1 ? h('span', { class: 'insp-multi', title: 'Los ajustes se aplican al último clip seleccionado' }, `+${state.selection.length - 1}`) : null
       )
     );
     if (clip.type === 'text') this.buildText(clip);
     if (M.isVisual(clip)) this.buildTransform(clip, p);
+    if (clip.type === 'video' || clip.type === 'image') this.buildCrop(clip, p);
+    if ('speed' in clip) this.buildSpeed(clip, p);
     if (clip.type === 'video' || clip.type === 'image') {
       this.buildZoom(clip, p);
       this.buildCensor(clip, p);
@@ -158,6 +175,7 @@ export class Inspector {
     if (M.isVisual(clip)) this.buildEffects(clip);
     if ('volume' in clip && (clip.type === 'audio' || M.clipHasAudio(p, clip) || clip.audioDetached)) this.buildAudio(clip, p);
     if (M.isVisual(clip) || M.clipHasAudio(p, clip)) this.buildTransitions(clip, p);
+    this.sync();
     this.el.scrollTop = scroll;
   }
 
@@ -200,7 +218,8 @@ export class Inspector {
           })
         ),
         this.add(colorRow({ label: 'Fondo', get: () => state.project.settings.background, set: (v) => A.setProjectSettings({ background: v }) })),
-        h('p', { class: 'insp-note' }, 'El proyecto toma por defecto la resolución y los fotogramas del primer video que añadas.'),
+        h('div', { class: 'btn-row' }, button('Más opciones (vertical, cuadrado, personalizado)…', () => openVideoSettings(), { small: true, block: true, icon: 'sliders' })),
+        h('p', { class: 'insp-note' }, 'El proyecto toma por defecto la resolución y los fotogramas del primer video que añadas. También puedes cambiarlos con Ctrl+K o desde el botón de resolución de la barra superior.'),
       ]),
       h(
         'div',
@@ -243,18 +262,132 @@ export class Inspector {
           } else clip[k] = v;
         }
       });
+    // Encaja (o hace cubrir) la parte visible del clip en el cuadro, teniendo en cuenta el recorte.
+    const place = (label, cover) => {
+      if (clip.type === 'text') return setMany(label, { x: 0, y: 0, scale: 1, rotation: 0 });
+      const [bw, bh] = baseSize(p, clip);
+      const c = A.cropAt(clip);
+      const vw = bw * (1 - c.cropL - c.cropR);
+      const vh = bh * (1 - c.cropT - c.cropB);
+      const sc = cover ? Math.max(W / vw, H / vh) : Math.min(W / vw, H / vh);
+      const round = (v) => Math.round(v * 1000) / 1000;
+      return setMany(label, { x: round(-((c.cropL - c.cropR) / 2) * bw * sc), y: round(-((c.cropT - c.cropB) / 2) * bh * sc), scale: round(sc), rotation: 0 });
+    };
+    this.place = place;
     const actions = h(
       'div',
       { class: 'btn-row' },
-      button('Ajustar', () => setMany('Ajustar al cuadro', { x: 0, y: 0, scale: 1, rotation: 0 }), { small: true, title: 'Centra y encaja el clip en el cuadro' }),
-      clip.type !== 'text'
-        ? button('Rellenar', () => {
-            const [bw, bh] = baseSize(p, clip);
-            setMany('Rellenar el cuadro', { x: 0, y: 0, scale: Math.max(W / bw, H / bh), rotation: 0 });
-          }, { small: true, title: 'Amplía hasta cubrir todo el cuadro' })
-        : null
+      button('Ajustar', () => place('Ajustar al cuadro', false), { small: true, title: 'Centra y encaja el clip en el cuadro' }),
+      clip.type !== 'text' ? button('Rellenar', () => place('Rellenar el cuadro', true), { small: true, title: 'Amplía hasta cubrir todo el cuadro' }) : null
     );
     this.el.append(this.sec('transform', 'Transformación', 'fit', [...rows, actions, h('p', { class: 'insp-note' }, 'También puedes arrastrar el clip en el visor. Pulsa ◆ para animar una propiedad con keyframes.')]));
+  }
+
+  // ------------------------------------------------------------------ recorte ----
+
+  buildCrop(clip, p) {
+    const media = M.mediaById(p, clip.mediaId);
+    const aspect = media && media.width && media.height ? media.width / media.height : p.settings.width / p.settings.height;
+    const cropping = state.viewerMode === 'crop';
+    const side = (label, prop) =>
+      this.add(sliderRow({ label, min: 0, max: 90, step: 0.1, def: 0, get: () => (evalProp(clip, prop, A.clipTs(clip)) || 0) * 100, set: (v) => A.setCrop(clip, prop, v / 100), format: fix(1), kf: this.kf(clip, prop, clip) }));
+    const RATIOS = [
+      { id: 'free', name: 'Libre' },
+      { id: 'orig', name: 'Original (sin recorte)', r: aspect },
+      { id: '16:9', name: '16:9 · horizontal', r: 16 / 9 },
+      { id: '9:16', name: '9:16 · vertical', r: 9 / 16 },
+      { id: '1:1', name: '1:1 · cuadrado', r: 1 },
+      { id: '4:5', name: '4:5 · retrato', r: 4 / 5 },
+      { id: '4:3', name: '4:3', r: 4 / 3 },
+      { id: '21:9', name: '21:9 · cine', r: 21 / 9 },
+    ];
+    const current = () => {
+      const c = A.cropAt(clip);
+      if (!c.cropL && !c.cropT && !c.cropR && !c.cropB) return 'orig';
+      const r = (aspect * (1 - c.cropL - c.cropR)) / (1 - c.cropT - c.cropB);
+      const hit = RATIOS.find((x) => x.r && x.id !== 'orig' && Math.abs(x.r / r - 1) < 0.004);
+      return hit ? hit.id : 'free';
+    };
+    const body = [
+      button(cropping ? 'Recortando… arrastra los bordes en el visor' : 'Recortar en el visor', () => (cropping ? setUI({ viewerMode: null }) : A.startCrop(clip)), { icon: 'crop', block: true, small: true, primary: !cropping }),
+      this.add(
+        selectRow({
+          label: 'Proporción',
+          options: RATIOS,
+          get: current,
+          set: (id) => {
+            const opt = RATIOS.find((x) => x.id === id);
+            if (opt && opt.r) A.cropToAspect(clip, opt.r, aspect);
+          },
+        })
+      ),
+      side('Izquierda %', 'cropL'),
+      side('Derecha %', 'cropR'),
+      side('Arriba %', 'cropT'),
+      side('Abajo %', 'cropB'),
+      h(
+        'div',
+        { class: 'btn-row' },
+        button('Rellenar el cuadro', () => this.place('Rellenar el cuadro', true), { small: true, title: 'Amplía lo que queda del clip hasta cubrir todo el cuadro' }),
+        button('Quitar recorte', () => A.resetCrop(clip), { small: true, icon: 'reset' })
+      ),
+      h('p', { class: 'insp-note' }, 'El recorte quita los bordes de la imagen. Con «Rellenar el cuadro» lo que queda ocupa toda la pantalla, por ejemplo para pasar un video horizontal a vertical.'),
+    ];
+    const sec = this.sec('crop', 'Recorte', 'crop', body, { badge: '●' });
+    // La marca se actualiza sin reconstruir el panel (reconstruirlo cortaría el arrastre de un control).
+    const badge = sec.querySelector('.sec-badge');
+    this.add({ el: sec, sync: () => { badge.style.display = A.hasCrop(clip) ? '' : 'none'; } });
+    this.el.append(sec);
+  }
+
+  // ---------------------------------------------------------------- velocidad ----
+
+  buildSpeed(clip, p) {
+    const fps = p.settings.fps;
+    const fd = 1 / fps;
+    const hasSound = clip.type === 'audio' || M.clipHasAudio(p, clip);
+    const span = M.sourceSpan(clip);
+    const PRESETS = [0.25, 0.5, 1, 1.5, 2, 4];
+    const presetBtns = PRESETS.map((v) => button(`${v}×`, () => A.setClipSpeed(clip, v), { small: true, title: v === 1 ? 'Velocidad normal' : v < 1 ? 'Cámara lenta' : 'Cámara rápida' }));
+    const status = {
+      el: h('div', { class: 'btn-row speed-presets' }, presetBtns),
+      sync: () => {
+        const v = M.speedOf(clip);
+        presetBtns.forEach((b, i) => b.classList.toggle('primary', Math.abs(PRESETS[i] - v) < 1e-3));
+      },
+    };
+    status.sync();
+    const body = [
+      this.add(sliderRow({ label: 'Velocidad ×', hint: 'Menos de 1 es cámara lenta; más de 1, cámara rápida. Doble clic para volver a 1×', min: 0.1, max: 4, step: 0.05, def: 1, hardMin: M.MIN_SPEED, hardMax: M.MAX_SPEED, get: () => M.speedOf(clip), set: (v) => A.setClipSpeed(clip, v), format: fix(2) })),
+      this.add(status),
+      this.add(
+        sliderRow({
+          label: 'Duración s',
+          hint: 'Escribe cuánto debe durar el clip y la velocidad se ajusta sola',
+          min: Math.max(fd, span / 4),
+          max: Math.max(fd * 2, span / 0.25),
+          step: fd,
+          hardMin: Math.max(fd, span / M.MAX_SPEED),
+          hardMax: Math.max(fd * 2, span / M.MIN_SPEED),
+          get: () => clip.duration,
+          set: (v) => A.setClipDuration(clip, v),
+          format: fix(2),
+        })
+      ),
+      hasSound ? this.add(toggleRow({ label: 'Mantener tono', hint: 'Evita que las voces suenen agudas o graves al cambiar la velocidad', get: () => clip.pitch !== false, set: (v) => A.setClipField(clip, 'pitch', !!v) })) : null,
+      h('p', { class: 'insp-note' }, 'El clip sigue mostrando el mismo material: al acelerarlo se acorta y al frenarlo se alarga. Zooms, censuras y keyframes se mueven con él.'),
+    ];
+    const sec = this.sec('speed', 'Velocidad', 'gauge', body, { badge: '1×' });
+    const badge = sec.querySelector('.sec-badge');
+    this.add({
+      el: sec,
+      sync: () => {
+        const v = M.speedOf(clip);
+        badge.textContent = `${Math.round(v * 100) / 100}×`;
+        badge.style.display = Math.abs(v - 1) > 1e-3 ? '' : 'none';
+      },
+    });
+    this.el.append(sec);
   }
 
   // -------------------------------------------------------------------- zoom ----
@@ -449,7 +582,10 @@ export class Inspector {
       param('Tono °', 'hue', -180, 180, 0, 1),
       h('div', { class: 'btn-row' }, button('Restablecer color', () => A.applyColorPreset([clip], 'none'), { small: true, icon: 'reset' })),
     ];
-    this.el.append(this.sec('color', 'Color', 'palette', body, { badge: clip.color ? '●' : null }));
+    const sec = this.sec('color', 'Color', 'palette', body, { badge: '●' });
+    const badge = sec.querySelector('.sec-badge');
+    this.add({ el: sec, sync: () => { badge.style.display = clip.color ? '' : 'none'; } });
+    this.el.append(sec);
   }
 
   // ----------------------------------------------------------------- efectos ----
@@ -577,7 +713,7 @@ export class Inspector {
         this.add(sliderRow({ label: 'Espaciado', min: -5 * k, max: 40 * k, step: 0.5, def: 0, get: () => clip.text.spacing, set: set('spacing'), format: fix(1) })),
         h('div', { class: 'sub-head' }, 'Borde'),
         this.add(sliderRow({ label: 'Grosor', min: 0, max: 40 * k, step: 0.5, def: 0, get: () => clip.text.strokeWidth, set: set('strokeWidth'), format: fix(1) })),
-        t.strokeWidth > 0 ? this.add(colorRow({ label: 'Color', get: () => clip.text.strokeColor, set: set('strokeColor') })) : null,
+        this.add(colorRow({ label: 'Color', get: () => clip.text.strokeColor, set: set('strokeColor') })),
         h('div', { class: 'sub-head' }, 'Sombra'),
         this.add(toggleRow({ label: 'Sombra', get: () => clip.text.shadow, set: set('shadow') })),
         t.shadow ? this.add(colorRow({ label: 'Color', get: () => clip.text.shadowColor, set: set('shadowColor') })) : null,

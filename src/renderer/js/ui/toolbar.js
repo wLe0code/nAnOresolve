@@ -1,6 +1,6 @@
 // Barra de herramientas de la línea temporal.
 
-import { state, on, setUI, select } from '../core/store.js';
+import { state, on, emit, setUI, select } from '../core/store.js';
 import * as A from '../core/actions.js';
 import { h } from '../core/util.js';
 import { icon } from './icons.js';
@@ -57,6 +57,34 @@ export function buildToolbar(timeline, recorder) {
     },
     { label: 'Censurar', cls: 'feature' }
   );
+  const cropBtn = tool(
+    'crop',
+    'Recortar la imagen: arrastra los bordes en el visor para quitar lo que sobra',
+    () => {
+      if (state.viewerMode === 'crop') return setUI({ viewerMode: null });
+      const clip = targetMediaClip();
+      if (!clip) return toast('Coloca el cursor sobre un video o una imagen para recortarlo');
+      ensureInspector();
+      A.startCrop(clip);
+      return emit('reveal-section', 'crop');
+    },
+    { label: 'Recorte', cls: 'feature' }
+  );
+  const speedBtn = tool(
+    'gauge',
+    'Velocidad: cámara lenta o rápida para el clip seleccionado',
+    () => {
+      const p = state.project;
+      const sel = p.clips.filter((c) => state.selection.includes(c.id) && 'speed' in c);
+      const under = p.clips.filter((c) => 'speed' in c && state.playhead >= c.start && state.playhead < c.start + c.duration);
+      const clip = sel[sel.length - 1] || under.find((c) => c.type === 'video') || under[0];
+      if (!clip) return toast('Selecciona un clip de video o de audio para cambiar su velocidad');
+      select(clip.id);
+      ensureInspector();
+      return emit('reveal-section', 'speed');
+    },
+    { label: 'Velocidad', cls: 'feature' }
+  );
   const textBtn = tool(
     'type',
     'Añadir un texto en el cursor',
@@ -79,7 +107,7 @@ export function buildToolbar(timeline, recorder) {
     sep(),
     h('div', { class: 'tool-group' }, splitBtn, delBtn),
     sep(),
-    h('div', { class: 'tool-group features' }, micBtn, zoomBtn, censorBtn, textBtn),
+    h('div', { class: 'tool-group features' }, micBtn, zoomBtn, censorBtn, cropBtn, speedBtn, textBtn),
     h('div', { class: 'tool-spacer' }),
     h(
       'div',
@@ -102,6 +130,7 @@ export function buildToolbar(timeline, recorder) {
     snapBtn.classList.toggle('on', state.snapping);
     rippleBtn.classList.toggle('on', state.ripple);
     censorBtn.classList.toggle('on', state.viewerMode === 'censor');
+    cropBtn.classList.toggle('on', state.viewerMode === 'crop');
     micBtn.classList.toggle('on', state.viewerMode === 'record');
     delBtn.disabled = state.selection.length === 0;
     if (document.activeElement !== zoomSlider) zoomSlider.value = toSlider(state.pxPerSec);

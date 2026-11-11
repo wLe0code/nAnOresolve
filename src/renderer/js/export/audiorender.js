@@ -21,11 +21,17 @@ export function audibleClips(project) {
   });
 }
 
-/** Lector secuencial de PCM (float32 estéreo) del audio de un medio, con memoria de los últimos segundos. */
+/**
+ * Lector secuencial de PCM (float32 estéreo) del audio de un medio, con memoria de los últimos
+ * segundos. Si el clip cambia de velocidad, FFmpeg ya entrega el audio estirado o comprimido:
+ * la muestra n corresponde al tiempo de origen t0 + n × velocidad / SR.
+ */
 class PcmStream {
-  constructor(sessionId, media, t0) {
+  constructor(sessionId, media, t0, speed = 1, pitch = true) {
     this.sessionId = sessionId;
     this.media = media;
+    this.speed = speed;
+    this.pitch = pitch;
     this.t0 = t0; // tiempo de origen de la muestra 0
     this.base = 0; // índice (en fotogramas de audio) del inicio de `data`
     this.data = new Float32Array(0);
@@ -35,7 +41,7 @@ class PcmStream {
 
   async fill(untilFrame) {
     if (this.decId === null && !this.eof) {
-      this.decId = await window.nano.exportOpenAudioDecoder(this.sessionId, { media: this.media, ss: this.t0, duration: 0 });
+      this.decId = await window.nano.exportOpenAudioDecoder(this.sessionId, { media: this.media, ss: this.t0, duration: 0, speed: this.speed, pitch: this.pitch });
     }
     const parts = [];
     let have = this.base + this.data.length / 2;
@@ -62,10 +68,13 @@ class PcmStream {
     }
   }
 
-  /** PCM entrelazado del tramo de origen [a, b) (puede venir más corto al final del archivo). */
+  /**
+   * PCM entrelazado del tramo de origen [a, b) (puede venir más corto al final del archivo).
+   * `skipped` son los segundos de salida que faltan al principio.
+   */
   async read(a, b) {
-    const fa = Math.max(0, Math.round((a - this.t0) * SR));
-    const fb = Math.max(fa, Math.round((b - this.t0) * SR));
+    const fa = Math.max(0, Math.round(((a - this.t0) / this.speed) * SR));
+    const fb = Math.max(fa, Math.round(((b - this.t0) / this.speed) * SR));
     await this.fill(fb);
     const end = Math.min(fb, this.base + this.data.length / 2);
     const start = Math.max(fa, this.base);
@@ -116,8 +125,9 @@ export async function renderAudio(project, sessionId, start, end, onProgress, ct
         const srcA = M.sourceTime(clip, a);
         const srcB = M.sourceTime(clip, b);
         const sA = Math.max(0, srcA);
-        if (srcB - sA < 1 / SR) continue;
-        if (!item.stream) item.stream = new PcmStream(sessionId, item.media, sA);
+        const speed = M.speedOf(clip);
+        if ((srcB - sA) / speed < 1 / SR) continue;
+        if (!item.stream) item.stream = new PcmStream(sessionId, item.media, sA, speed, clip.pitch !== false);
         const { pcm, skipped } = await item.stream.read(sA, srcB);
         const frames = pcm.length >> 1;
         if (frames < 2) continue;
@@ -137,7 +147,7 @@ export async function renderAudio(project, sessionId, start, end, onProgress, ct
         fx.output.connect(gain);
         gain.connect(master.input);
 
-        const when = Math.max(0, a + (sA - srcA) + skipped - T0);
+        const when = Math.max(0, a + (sA - srcA) / speed + skipped - T0);
         const dur = frames / SR;
         const n = Math.max(2, Math.ceil(dur * 200) + 1);
         const curve = new Float32Array(n);

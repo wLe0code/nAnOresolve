@@ -4,14 +4,14 @@ import { state, on, setUI, primaryClip, selectedClips } from '../core/store.js';
 import * as M from '../core/model.js';
 import * as A from '../core/actions.js';
 import { h, clear, formatDur, debounce } from '../core/util.js';
-import { rt, importPaths, retryMedia } from '../media/library.js';
+import { rt, importPaths, retryMedia, setTonemap, TONEMAP_DEFAULT } from '../media/library.js';
 import { COLOR_PRESETS, colorFromPreset, TRANSITIONS, AUDIO_TRANSITIONS, VIDEO_EFFECTS, AUDIO_EFFECTS, TEXT_PRESETS, TEXT_DEFAULT } from '../core/presets.js';
 import { Compositor } from '../render/compositor.js';
 import { renderText } from '../render/textrender.js';
 import { buildScene, sceneLayers } from '../render/scene.js';
 import { engine } from '../playback/engine.js';
 import { icon } from './icons.js';
-import { toast, contextMenu, confirmDialog } from './widgets.js';
+import { toast, contextMenu, confirmDialog, modal } from './widgets.js';
 import { setDrag } from './dnd.js';
 import { applyPayload } from './timeline.js';
 
@@ -27,6 +27,60 @@ export async function importDialog() {
   const paths = await window.nano.openMediaDialog();
   if (!paths || !paths.length) return [];
   return importPaths(paths, (name, err) => toast(`No se pudo importar ${name}: ${err}`, 'error'));
+}
+
+const HDR_CURVES = [
+  { id: 'hable', name: 'Cine (recomendada)', hint: 'Comprime las luces altas con suavidad y conserva el contraste.' },
+  { id: 'mobius', name: 'Natural', hint: 'Mantiene colores y medios tonos; solo suaviza lo más brillante.' },
+  { id: 'reinhard', name: 'Suave', hint: 'Imagen más plana, con todo el detalle de las luces.' },
+  { id: 'clip', name: 'Directa', hint: 'Sin comprimir: lo que supere el blanco se quema.' },
+];
+
+/** Diálogo para elegir cómo se convierte a color estándar un video HDR. */
+export function hdrDialog(media) {
+  const cur = { ...TONEMAP_DEFAULT, ...(media.tonemap || {}) };
+  const hint = h('div', { class: 'form-hint' });
+  const curve = h('select', { class: 'select' }, HDR_CURVES.map((c) => h('option', { value: c.id }, c.name)));
+  curve.value = cur.curve;
+  const value = h('span', { class: 'mono' });
+  const bright = h('input', { type: 'range', class: 'slider', min: -2, max: 2, step: 0.1 });
+  bright.value = cur.brightness;
+  const sync = () => {
+    hint.textContent = HDR_CURVES.find((c) => c.id === curve.value).hint;
+    const v = Number(bright.value);
+    value.textContent = `${v > 0 ? '+' : ''}${v.toFixed(1)}`;
+    bright.style.setProperty('--fill', `${((v + 2) / 4) * 100}%`);
+  };
+  curve.addEventListener('change', sync);
+  bright.addEventListener('input', sync);
+  bright.addEventListener('dblclick', () => { bright.value = 0; sync(); });
+  sync();
+  const row = (label, control, extra) => h('div', { class: 'form-row' }, h('label', {}, label), h('div', { class: 'form-control' }, control, extra || null));
+  modal({
+    title: 'Ajustes de HDR',
+    width: 440,
+    body: h(
+      'div',
+      {},
+      h('p', { class: 'form-note', style: { marginTop: '0', marginBottom: '14px' } }, `«${media.name}» está grabado en HDR. Aquí eliges cómo se adapta a una pantalla normal; el archivo original no se modifica.`),
+      row('Curva', curve, hint),
+      row('Brillo', h('div', { class: 'hdr-bright' }, bright, value), h('div', { class: 'form-hint' }, 'Pasos de exposición. Doble clic para volver a 0.')),
+      h('p', { class: 'form-note' }, 'Al aplicar se vuelve a preparar la vista previa de este archivo. La exportación usará los mismos ajustes.')
+    ),
+    buttons: [
+      { label: 'Cancelar', run: (m) => m.close() },
+      {
+        label: 'Aplicar',
+        primary: true,
+        run: (m) => {
+          const next = { curve: curve.value, brightness: Math.round(Number(bright.value) * 10) / 10 };
+          m.close();
+          if (next.curve === cur.curve && next.brightness === cur.brightness) return;
+          setTonemap(media.id, next).catch((e) => toast(`No se pudo aplicar: ${e.message || e}`, 'error'));
+        },
+      },
+    ],
+  });
 }
 
 /** Clip de video o imagen sobre el que actúan las herramientas: el seleccionado o el que está bajo el cursor. */
@@ -155,6 +209,7 @@ export class LeftPanel {
             { label: 'Añadir en el cursor', icon: 'split', run: () => A.addMediaToTimeline(media, { start: state.playhead }) },
             { label: 'Mostrar en la carpeta', icon: 'folder', run: () => window.nano.showItem(media.path) },
             r.status === 'error' || r.status === 'offline' ? { label: 'Reintentar', icon: 'reset', run: () => retryMedia(media) } : null,
+            media.hdr ? { label: 'Ajustes de HDR…', icon: 'sliders', disabled: r.status === 'proxy' || r.status === 'loading', run: () => hdrDialog(media) } : null,
             '-',
             {
               label: 'Quitar del proyecto',
@@ -220,8 +275,10 @@ export class LeftPanel {
     }
     el.classList.toggle('busy', r.status !== 'ready');
     el.classList.toggle('failed', r.status === 'error' || r.status === 'offline');
-    badge.textContent = r.status === 'ready' && r.previewPath ? 'PROXY' : '';
-    badge.title = 'Se usa una copia ligera para la vista previa. La exportación usa siempre el archivo original.';
+    badge.textContent = media.hdr ? 'HDR' : r.status === 'ready' && r.previewPath ? 'PROXY' : '';
+    badge.title = media.hdr
+      ? 'Video HDR: se convierte a color estándar. Clic derecho → Ajustes de HDR para cambiar el brillo o la curva.'
+      : 'Se usa una copia ligera para la vista previa. La exportación usa siempre el archivo original.';
     if (r.status === 'ready') status.textContent = '';
     else if (r.status === 'proxy') status.textContent = `Preparando vista previa… ${Math.round(r.progress * 100)}%`;
     else if (r.status === 'error') status.textContent = r.error || 'No se pudo cargar';

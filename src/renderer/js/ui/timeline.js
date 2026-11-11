@@ -1,7 +1,7 @@
 // Línea temporal: dibujo en canvas e interacción (seleccionar, mover, recortar, cortar con
 // cuchilla, imán, zooms, keyframes, fundidos y arrastre desde los paneles).
 
-import { state, on, setUI, setPlayhead, select, isSelected, beginTxn, endTxn, touch, mutate } from '../core/store.js';
+import { state, on, emit, setUI, setPlayhead, select, isSelected, beginTxn, endTxn, touch, mutate } from '../core/store.js';
 import * as M from '../core/model.js';
 import * as A from '../core/actions.js';
 import { clamp, h, clear, rafThrottle, EPS } from '../core/util.js';
@@ -729,6 +729,7 @@ export class Timeline {
     const o = d.orig.get(clip.id);
     const fd = M.frameDur(p);
     const maxDur = M.maxSourceDuration(p, clip);
+    const k = M.speedOf(clip); // segundos de origen por segundo de línea temporal
     const main = M.mainTrack(p);
     const ripple = state.ripple && !e.altKey && main && clip.trackId === main.id;
     const oEnd = o.start + o.duration;
@@ -747,7 +748,7 @@ export class Timeline {
     const others = M.trackClips(p, clip.trackId, except);
 
     if (d.kind === 'trim-r') {
-      let maxEnd = o.start + (maxDur - o.in);
+      let maxEnd = o.start + (maxDur - o.in) / k;
       if (!ripple) {
         const next = others.find((c) => c.start >= oEnd - EPS);
         if (next) maxEnd = Math.min(maxEnd, next.start);
@@ -757,20 +758,20 @@ export class Timeline {
       if (ripple) this.noteSkipped(M.rippleShift(p, oEnd, newEnd - oEnd, { except }));
     } else if (ripple) {
       // Recorte de entrada con cierre de huecos: el inicio se queda y el resto se recorre.
-      const minDelta = Number.isFinite(maxDur) ? -o.in : -3600;
+      const minDelta = Number.isFinite(maxDur) ? -M.floorFrame(p, o.in / k) : -3600;
       const delta = M.snapFrame(p, clamp(t - o.start, minDelta, o.duration - fd));
-      clip.in = o.in + delta;
+      clip.in = Math.max(0, o.in + delta * k);
       clip.duration = o.duration - delta;
       this.noteSkipped(M.rippleShift(p, oEnd, -delta, { except }));
     } else {
       let minStart = 0;
       const prev = [...others].reverse().find((c) => M.clipEnd(c) <= o.start + EPS);
       if (prev) minStart = M.clipEnd(prev);
-      if (Number.isFinite(maxDur)) minStart = Math.max(minStart, M.snapFrame(p, o.start - o.in + fd * 0.499));
+      if (Number.isFinite(maxDur)) minStart = Math.max(minStart, M.snapFrame(p, o.start - o.in / k + fd * 0.499));
       const newStart = clamp(t, minStart, oEnd - fd);
       const delta = newStart - o.start;
       clip.start = newStart;
-      clip.in = o.in + delta;
+      clip.in = Math.max(0, o.in + delta * k);
       clip.duration = o.duration - delta;
     }
     touch();
@@ -806,14 +807,14 @@ export class Timeline {
     const clip = d.clip;
     const z = d.zoom;
     const lo = clip.in;
-    const hi = clip.in + clip.duration;
-    let dts = (x - d.x0) / this.pps;
+    const hi = M.sourceEnd(clip);
+    const dts = ((x - d.x0) / this.pps) * M.speedOf(clip);
     const len = d.e0 - d.s0;
     const snapTs = (ts) => {
       if (!state.snapping || e.ctrlKey) return ts;
       const s = this.snapTime(A.tsToTimeline(clip, ts), [state.playhead, clip.start, M.clipEnd(clip)]);
       this.snapLine = s.hit;
-      return s.hit === null ? ts : clip.in + (s.t - clip.start);
+      return s.hit === null ? ts : M.sourceTime(clip, s.t);
     };
     this.snapLine = null;
     if (d.kind === 'zoom') {
@@ -849,7 +850,7 @@ export class Timeline {
       }
     }
     t = clamp(M.snapFrame(p, t), clip.start, M.clipEnd(clip));
-    const ts = clip.in + (t - clip.start);
+    const ts = M.sourceTime(clip, t);
     if (Math.abs(ts - d.cur) < 1e-6) return;
     for (const o of [clip, ...(clip.effects || []), ...(clip.censors || [])]) shiftKeys(o, d.cur, ts);
     d.cur = ts;
@@ -910,6 +911,9 @@ export class Timeline {
         clip.type === 'video' && M.clipHasAudio(p, clip) ? { label: 'Separar audio', icon: 'wave', run: () => A.detachAudio(clip) } : null,
         'volume' in clip ? { label: clip.muted ? 'Activar sonido del clip' : 'Silenciar clip', icon: clip.muted ? 'volume' : 'volumeX', run: () => A.setClipField(clip, 'muted', !clip.muted) } : null,
         clip.zooms ? { label: 'Añadir zoom aquí', icon: 'zoomIn', run: () => { setPlayhead(t); A.addZoom(clip); } } : null,
+        'speed' in clip ? { label: 'Cambiar velocidad…', icon: 'gauge', run: () => { if (state.workspace === 'cut') setUI({ workspace: 'edit' }); emit('reveal-section', 'speed'); } } : null,
+        Math.abs(M.speedOf(clip) - 1) > 1e-3 ? { label: 'Volver a velocidad normal', icon: 'reset', run: () => A.setClipSpeed(clip, 1) } : null,
+        clip.type === 'video' || clip.type === 'image' ? { label: 'Recortar imagen…', icon: 'crop', run: () => { if (state.workspace === 'cut') setUI({ workspace: 'edit' }); A.startCrop(clip); emit('reveal-section', 'crop'); } } : null,
         clip.transIn ? { label: 'Quitar transición de entrada', icon: 'transition', run: () => A.removeTransition(clip, 'in') } : null,
         clip.transOut ? { label: 'Quitar transición de salida', icon: 'transition', run: () => A.removeTransition(clip, 'out') } : null,
         clip.audioTransIn ? { label: 'Quitar fundido cruzado de audio', icon: 'wave', run: () => A.setClipField(clip, 'audioTransIn', null) } : null,
@@ -1231,14 +1235,15 @@ export class Timeline {
     if ((clip.type === 'video' || clip.type === 'image') && media && w > 10) {
       const aspect = media.width && media.height ? media.width / media.height : 16 / 9;
       const tw = Math.max(8, thumbH * aspect);
-      const dt = tw / this.pps;
+      const k = M.speedOf(clip);
+      const dt = (tw / this.pps) * k; // segundos de origen que cubre cada miniatura
       const step = niceStep(dt);
-      const srcVis0 = clip.in + (this.tAt(vx0) - clip.start);
-      const srcVis1 = clip.in + (this.tAt(vx1) - clip.start);
+      const srcVis0 = M.sourceTime(clip, this.tAt(vx0));
+      const srcVis1 = M.sourceTime(clip, this.tAt(vx1));
       const j0 = Math.floor(srcVis0 / dt);
       const j1 = Math.ceil(srcVis1 / dt);
       for (let j = j0; j < j1; j++) {
-        const tx = x + (j * dt - clip.in) * this.pps;
+        const tx = x + ((j * dt - clip.in) / k) * this.pps;
         const ts = clip.type === 'image' ? 0 : Math.max(0, Math.floor((j * dt) / step + 1e-6) * step);
         const bmp = r && r.status === 'ready' ? thumb(media, ts) : null;
         if (bmp) ctx.drawImage(bmp, tx, y, tw + 0.5, thumbH);
@@ -1255,7 +1260,7 @@ export class Timeline {
       }
       const levels = r && r.peaks;
       if (levels) {
-        const perPx = PEAKS_PER_SECOND / this.pps;
+        const perPx = (PEAKS_PER_SECOND * M.speedOf(clip)) / this.pps;
         let L = 0;
         while (L < levels.length - 1 && perPx / (1 << L) > 2) L++;
         const data = levels[L];
@@ -1267,7 +1272,7 @@ export class Timeline {
         ctx.globalAlpha = 0.85;
         ctx.beginPath();
         for (let px = Math.floor(vx0); px < vx1; px += 1) {
-          const ts = clip.in + (this.tAt(px) - clip.start);
+          const ts = M.sourceTime(clip, this.tAt(px));
           if (ts < 0) continue;
           const i = Math.floor(ts * scale);
           if (i >= data.length) break;
@@ -1301,6 +1306,9 @@ export class Timeline {
       ctx.font = '11px "Segoe UI", system-ui, sans-serif';
       ctx.textBaseline = 'middle';
       const tags = [];
+      const spd = M.speedOf(clip);
+      if (Math.abs(spd - 1) > 1e-3) tags.push(`${Math.round(spd * 100) / 100}×`);
+      if (A.hasCrop(clip)) tags.push('recorte');
       if (clip.color) tags.push('color');
       if (clip.effects && clip.effects.some((e2) => e2.enabled)) tags.push('fx');
       if (clip.censors && clip.censors.length) tags.push('censura');

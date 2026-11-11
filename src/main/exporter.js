@@ -7,7 +7,7 @@ const fs = require('fs');
 const os = require('os');
 const { spawn } = require('child_process');
 const { binaries, capabilities, run } = require('./ffmpeg');
-const { guessMatrix, TONEMAP_CHAIN } = require('./media');
+const { guessMatrix, tonemapChain } = require('./media');
 
 const sessions = new Map();
 const decoders = new Map();
@@ -124,18 +124,100 @@ const QUALITY = {
 
 const SPEED = { fast: 'veryfast', balanced: 'medium', slow: 'slow' };
 
-function videoEncoderArgs(opts, audioPath) {
+// ------------------------------------------------- codificación por GPU ----
+
+// Codificadores por hardware, por orden de preferencia. Solo se ofrecen los que de verdad
+// funcionan en este equipo (se comprueba codificando unos fotogramas de prueba).
+const HW_CANDIDATES = {
+  h264: ['h264_nvenc', 'h264_qsv', 'h264_amf', 'h264_videotoolbox'],
+  hevc: ['hevc_nvenc', 'hevc_qsv', 'hevc_amf', 'hevc_videotoolbox'],
+};
+const HW_VENDOR = { nvenc: 'NVIDIA', qsv: 'Intel', amf: 'AMD', videotoolbox: 'Apple' };
+const HW_FAMILY = { 'mp4-h264': 'h264', 'mkv-h264': 'h264', 'mp4-h265': 'hevc' };
+const HW_QUALITY = { max: 16, high: 20, medium: 24, low: 29 };
+
+const hwKind = (enc) => enc.split('_').slice(1).join('_');
+
+/** Argumentos de un codificador por hardware a calidad constante. */
+function hwEncoderArgs(enc, opts) {
+  const kind = hwKind(enc);
+  const hevc = enc.startsWith('hevc');
+  const q = (HW_QUALITY[opts.quality] || HW_QUALITY.high) + (hevc ? 2 : 0);
+  const a = ['-c:v', enc];
+  if (kind === 'nvenc') {
+    a.push('-preset', { fast: 'p3', balanced: 'p5', slow: 'p7' }[opts.speed] || 'p5', '-tune', 'hq', '-rc', 'vbr', '-cq', String(q), '-b:v', '0');
+  } else if (kind === 'qsv') {
+    a.push('-preset', { fast: 'veryfast', balanced: 'medium', slow: 'veryslow' }[opts.speed] || 'medium', '-global_quality', String(q));
+  } else if (kind === 'amf') {
+    a.push('-usage', 'transcoding', '-quality', { fast: 'speed', balanced: 'balanced', slow: 'quality' }[opts.speed] || 'balanced', '-rc', 'cqp', '-qp_i', String(q), '-qp_p', String(q + 1), '-qp_b', String(q + 3));
+  } else {
+    a.push('-q:v', String(Math.max(20, Math.min(90, 100 - q * 2))));
+  }
+  if (!hevc) a.push('-profile:v', 'high');
+  else a.push('-tag:v', 'hvc1');
+  // Algunos codificadores por hardware no escriben el espacio de color: se anota en el propio flujo.
+  a.push('-bsf:v', `${hevc ? 'hevc' : 'h264'}_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0`);
+  return a;
+}
+
+async function hwWorks(enc, width, height, opts) {
+  const { ffmpeg } = binaries();
+  const args = ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', `color=c=gray:s=${width}x${height}:r=30:d=0.2`, '-vf', 'format=nv12', ...hwEncoderArgs(enc, opts), '-f', 'null', '-'];
+  try {
+    const r = await run(ffmpeg, args);
+    return r.code === 0;
+  } catch {
+    return false;
+  }
+}
+
+let hwPromise = null;
+/** Codificadores por GPU utilizables: { h264, hevc, label } (null si no hay). */
+function hwEncoders() {
+  if (!hwPromise) {
+    hwPromise = (async () => {
+      const caps = await capabilities();
+      const out = { h264: null, hevc: null, label: '' };
+      for (const family of ['h264', 'hevc']) {
+        for (const enc of HW_CANDIDATES[family]) {
+          if (caps.encoders.has(enc) && (await hwWorks(enc, 640, 360, { quality: 'high', speed: 'balanced' }))) {
+            out[family] = enc;
+            break;
+          }
+        }
+      }
+      const any = out.h264 || out.hevc;
+      if (any) out.label = HW_VENDOR[hwKind(any)] || 'GPU';
+      return out;
+    })();
+  }
+  return hwPromise;
+}
+
+function videoEncoderArgs(opts, audioPath, hwEnc) {
   const q = QUALITY[opts.quality] || QUALITY.high;
   const preset = SPEED[opts.speed] || SPEED.balanced;
   const a = ['-y', '-hide_banner', '-loglevel', 'error', '-nostats'];
-  a.push('-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', `${opts.width}x${opts.height}`, '-r', fpsString(opts.fps), '-i', 'pipe:0');
+  // La interfaz entrega RGBA o, en la ruta rápida, NV12 ya convertido a BT.709 de rango limitado.
+  const nv12 = opts.pixFmt === 'nv12';
+  a.push('-f', 'rawvideo', '-pix_fmt', nv12 ? 'nv12' : 'rgba');
+  if (nv12) a.push('-color_range', 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709');
+  a.push('-s', `${opts.width}x${opts.height}`, '-r', fpsString(opts.fps), '-i', 'pipe:0');
   if (audioPath) a.push('-f', 'f32le', '-ar', String(SAMPLE_RATE), '-ac', '2', '-i', audioPath);
   a.push('-map', '0:v:0');
   if (audioPath) a.push('-map', '1:a:0');
 
-  const toYuv = (fmt) => `scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int,format=${fmt}`;
+  const toYuv = (fmt) => (nv12 ? `format=${fmt}` : `scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int,format=${fmt}`);
   const tags = ['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-color_range', 'tv'];
   const audio = (codec, extra = []) => (audioPath ? ['-c:a', codec, ...extra] : []);
+
+  if (hwEnc) {
+    a.push('-vf', toYuv('nv12'), ...hwEncoderArgs(hwEnc, opts), ...tags);
+    if (opts.format === 'mkv-h264') a.push(...audio('flac'));
+    else a.push(...audio('aac', ['-b:a', `${q.audio}k`]), '-movflags', '+faststart');
+    a.push('-metadata', 'comment=Creado con nAnOresolve', opts.outPath);
+    return a;
+  }
 
   switch (opts.format) {
     case 'mp4-h265':
@@ -224,7 +306,16 @@ async function startEncoder(id) {
   const s = getSession(id);
   await closeAudio(s);
   const { ffmpeg } = binaries();
-  const args = videoEncoderArgs(s.opts, s.audioPath);
+  // Codificación por GPU si se pidió, existe para este formato y funciona a esta resolución;
+  // si no, se usa el procesador sin interrumpir la exportación.
+  let hwEnc = null;
+  const family = HW_FAMILY[s.opts.format];
+  if (s.opts.hw && family) {
+    const hw = await hwEncoders();
+    if (hw[family] && (await hwWorks(hw[family], s.opts.width, s.opts.height, s.opts))) hwEnc = hw[family];
+  }
+  s.encoderName = hwEnc || 'software';
+  const args = videoEncoderArgs(s.opts, s.audioPath, hwEnc);
   const child = spawn(ffmpeg, args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
   s.encoder = child;
   child.stderr.on('data', (c) => {
@@ -243,7 +334,7 @@ async function startEncoder(id) {
       resolve(code);
     });
   });
-  return true;
+  return { hw: !!hwEnc, encoder: s.encoderName, fallback: !!s.opts.hw && !hwEnc };
 }
 
 /** Envía un fotograma RGBA ya compuesto al codificador. */
@@ -281,15 +372,46 @@ async function openVideoDecoder(id, p) {
   const info = p.media;
   const vf = [];
   if (info.interlaced) vf.push('yadif=0:-1:0');
-  if (info.hdr && caps.filters.has('zscale') && caps.filters.has('tonemap')) vf.push(TONEMAP_CHAIN);
+  if (info.hdr && caps.filters.has('zscale') && caps.filters.has('tonemap')) vf.push(tonemapChain(info));
+  // Cambio de velocidad: se reescala el tiempo y el filtro fps repite o descarta fotogramas.
+  const speed = p.speed > 0 ? p.speed : 1;
+  if (Math.abs(speed - 1) > 1e-6) vf.push(`setpts=PTS/${speed}`);
   vf.push(`fps=${fpsString(p.fps)}:start_time=0`);
   const matrix = guessMatrix(info);
-  vf.push(`scale=${p.width}:${p.height}:flags=lanczos+accurate_rnd+full_chroma_int${matrix ? `:in_color_matrix=${matrix}` : ''}`);
+  let pixFmt;
+  let frameSize;
+  if (p.yuv) {
+    // Ruta rápida: se entrega YUV 4:2:0 de 8 bits y rango limitado sin tocar la matriz de color;
+    // la conversión a RGB la hace el compositor en la tarjeta gráfica.
+    vf.push(`scale=${p.width}:${p.height}:flags=lanczos+accurate_rnd:out_range=tv`);
+    pixFmt = 'nv12';
+    frameSize = p.width * p.height * 1.5;
+  } else {
+    vf.push(`scale=${p.width}:${p.height}:flags=lanczos+accurate_rnd+full_chroma_int${matrix ? `:in_color_matrix=${matrix}` : ''}`);
+    pixFmt = p.alpha ? 'rgba' : 'rgb24';
+    frameSize = p.width * p.height * (p.alpha ? 4 : 3);
+  }
   vf.push('setsar=1');
-  const channels = p.alpha ? 4 : 3;
-  const args = ['-hide_banner', '-loglevel', 'error', '-nostats', '-ss', String(Math.max(0, p.ss)), '-i', info.path, '-map', `0:${info.videoIndex}`, '-an', '-sn', '-dn', '-vf', vf.join(','), '-f', 'rawvideo', '-pix_fmt', channels === 4 ? 'rgba' : 'rgb24', 'pipe:1'];
-  const frameSize = p.width * p.height * channels;
+  const args = ['-hide_banner', '-loglevel', 'error', '-nostats', '-ss', String(Math.max(0, p.ss)), '-i', info.path, '-map', `0:${info.videoIndex}`, '-an', '-sn', '-dn', '-vf', vf.join(','), '-f', 'rawvideo', '-pix_fmt', pixFmt, 'pipe:1'];
   return openDecoder(s, ffmpeg, args, frameSize * 3, { frameSize });
+}
+
+/**
+ * Filtros de audio para un cambio de velocidad. Conservando el tono se estira el tiempo
+ * (atempo); sin conservarlo se reproduce más rápido o más lento, como una cinta.
+ */
+function speedFilters(speed, keepPitch) {
+  if (!(speed > 0) || Math.abs(speed - 1) < 1e-6) return [];
+  if (!keepPitch) return [`aresample=${SAMPLE_RATE}`, `asetrate=${Math.round(SAMPLE_RATE * speed)}`, `aresample=${SAMPLE_RATE}`];
+  // Un solo atempo cubre de 0,5× a 100× (encadenar varios acumula error de duración).
+  const out = [];
+  let s = speed;
+  while (s < 0.5 - 1e-9) {
+    out.push('atempo=0.5');
+    s /= 0.5;
+  }
+  out.push(`atempo=${s.toFixed(6)}`);
+  return out;
 }
 
 /** Abre un decodificador de audio que entrega PCM float32 estéreo a 48 kHz. */
@@ -299,10 +421,12 @@ async function openAudioDecoder(id, p) {
   const info = p.media;
   const args = ['-hide_banner', '-loglevel', 'error', '-nostats', '-ss', String(Math.max(0, p.ss)), '-i', info.path, '-map', `0:${info.audioIndex}`, '-vn', '-sn', '-dn'];
   if (p.duration > 0) args.push('-t', String(p.duration));
+  const af = [];
   // Mono -> estéreo sin atenuar (igual que hace la vista previa); el resto usa la mezcla estándar.
-  if (info.channels === 1) args.push('-af', 'pan=stereo|c0=c0|c1=c0');
-  else args.push('-ac', '2');
-  args.push('-ar', String(SAMPLE_RATE), '-f', 'f32le', 'pipe:1');
+  if (info.channels === 1) af.push('pan=stereo|c0=c0|c1=c0');
+  af.push(...speedFilters(p.speed, p.pitch !== false));
+  if (af.length) args.push('-af', af.join(','));
+  args.push('-ac', '2', '-ar', String(SAMPLE_RATE), '-f', 'f32le', 'pipe:1');
   return openDecoder(s, ffmpeg, args, SAMPLE_RATE * 8 * 4, {});
 }
 
@@ -401,4 +525,4 @@ async function cancelAll() {
   await Promise.all([...sessions.keys()].map((id) => cancel(id)));
 }
 
-module.exports = { begin, audioWrite, startEncoder, writeFrame, openVideoDecoder, openAudioDecoder, readFrame, readAudio, closeDecoder, finish, cancel, cancelAll, SAMPLE_RATE };
+module.exports = { hwEncoders, begin, audioWrite, startEncoder, writeFrame, openVideoDecoder, openAudioDecoder, readFrame, readAudio, closeDecoder, finish, cancel, cancelAll, SAMPLE_RATE };

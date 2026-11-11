@@ -10,7 +10,8 @@ import { exportProject } from '../export/exporter.js';
 import { modal, toast } from './widgets.js';
 import { icon } from './icons.js';
 
-let lastOptions = { format: 'mp4-h264', quality: 'high', speed: 'balanced', height: 0, fps: 0 };
+let lastOptions = { format: 'mp4-h264', quality: 'high', speed: 'balanced', height: 0, fps: 0, encoder: 'cpu' };
+const HW_FAMILY = { 'mp4-h264': 'h264', 'mkv-h264': 'h264', 'mp4-h265': 'hevc' };
 let exporting = false;
 
 export const isExporting = () => exporting;
@@ -45,6 +46,7 @@ export function openExportDialog() {
   const fpsOptions = [{ id: 0, name: `Igual que el proyecto · ${project.settings.fps} fps` }, ...FRAME_RATES.filter((f) => f !== project.settings.fps).map((f) => ({ id: f, name: `${f} fps` }))];
   const opt = { ...lastOptions };
   if (!resOptions.some((r) => r.id === opt.height)) opt.height = 0;
+  let dlgClosed = false;
 
   const select = (options, key, onChange) => {
     const el = h(
@@ -67,17 +69,38 @@ export function openExportDialog() {
   const formatHint = h('div', { class: 'form-hint' });
   const qualityHint = h('div', { class: 'form-hint' });
   const videoFields = h('div', {});
+  // Codificación por GPU: solo se ofrece si este equipo tiene un codificador que funciona
+  // para el formato elegido.
+  let hw = null;
+  const encHint = h('div', { class: 'form-hint' });
+  const encSelect = h('select', { class: 'select', onchange: () => { opt.encoder = encSelect.value; updateHints(); } });
+  const encRow = field('Procesar con', encSelect, encHint);
+  const hwFor = () => (hw && HW_FAMILY[opt.format] ? hw[HW_FAMILY[opt.format]] : null);
   const updateHints = () => {
     const f = EXPORT_FORMATS.find((x) => x.id === opt.format);
     formatHint.textContent = f.hint;
     qualityHint.textContent = EXPORT_QUALITIES.find((x) => x.id === opt.quality).hint;
     videoFields.style.display = f.audioOnly ? 'none' : '';
+    const enc = hwFor();
+    encRow.style.display = enc ? '' : 'none';
+    if (enc) {
+      encSelect.replaceChildren(h('option', { value: 'cpu' }, 'Procesador · recomendado'), h('option', { value: 'gpu' }, `Tarjeta gráfica ${hw.label} · más rápido`));
+      encSelect.value = opt.encoder === 'gpu' ? 'gpu' : 'cpu';
+      encHint.textContent = opt.encoder === 'gpu' ? 'La tarjeta gráfica codifica el video: exporta antes y deja el procesador más libre.' : 'El procesador codifica el video: la calidad más cuidada y el archivo más compatible.';
+    }
   };
   videoFields.append(
     field('Resolución', select(resOptions, 'height')),
     field('Fotogramas', select(fpsOptions, 'fps')),
-    field('Codificación', select([{ id: 'fast', name: 'Rápida' }, { id: 'balanced', name: 'Equilibrada' }, { id: 'slow', name: 'Lenta (archivo más pequeño)' }], 'speed'))
+    field('Codificación', select([{ id: 'fast', name: 'Rápida' }, { id: 'balanced', name: 'Equilibrada' }, { id: 'slow', name: 'Lenta (archivo más pequeño)' }], 'speed')),
+    encRow
   );
+  Promise.resolve(window.nano.exportHwEncoders ? window.nano.exportHwEncoders() : null)
+    .then((res) => {
+      hw = res && (res.h264 || res.hevc) ? res : null;
+      if (!dlgClosed) updateHints();
+    })
+    .catch(() => {});
 
   const form = h(
     'div',
@@ -101,6 +124,7 @@ export function openExportDialog() {
     width: 500,
     buttons: [],
     onClose: () => {
+      dlgClosed = true;
       if (ctl && exporting) ctl.cancelled = true;
     },
   });
@@ -166,13 +190,15 @@ export function openExportDialog() {
     };
 
     try {
-      const result = await exportProject(project, { outPath, width: res.w, height: res.h, fps, format: f.id, quality: opt.quality, speed: opt.speed, audioOnly: !!f.audioOnly }, onProgress, ctl);
+      const result = await exportProject(project, { outPath, width: res.w, height: res.h, fps, format: f.id, quality: opt.quality, speed: opt.speed, hw: opt.encoder === 'gpu' && !!hwFor(), audioOnly: !!f.audioOnly }, onProgress, ctl);
       exporting = false;
       dlg.locked = false;
       const secs = (performance.now() - t0) / 1000;
       progress.replaceChildren(
         h('div', { class: 'export-done' }, h('span', { class: 'done-ico', html: icon('check', 26) }), h('div', {}, h('b', {}, 'Exportación completada'), h('span', {}, `${formatBytes(result.size)} · ${formatDur(secs)} de proceso`))),
         h('div', { class: 'export-path', title: result.path }, result.path),
+        result.encoder && result.encoder.hw ? h('div', { class: 'form-hint' }, `Video codificado con la tarjeta gráfica (${hw ? hw.label : 'GPU'}).`) : null,
+        result.encoder && result.encoder.fallback ? h('div', { class: 'export-warn' }, 'La tarjeta gráfica no pudo codificar a este tamaño: se usó el procesador.') : null,
         result.warnings && result.warnings.length ? h('div', { class: 'export-warn' }, `Avisos: ${result.warnings.slice(0, 3).join(' · ')}`) : null
       );
       dlg.setButtons([

@@ -117,7 +117,18 @@ async function prepare(media) {
         r.status = 'proxy';
         r.progress = 0;
         notify(media.id);
-        r.previewPath = await window.nano.makeProxy(media);
+        // Si la imagen ya es reproducible se prueba primero una copia ligera (solo convierte el
+        // audio); si el original falló pese a parecer compatible, se va directo a la completa.
+        let full = !!media.nativeHint || media.type !== 'video' || !media.videoNative;
+        let proxy = await window.nano.makeProxy(media, { full });
+        if (!full && !(await testPlayable(mediaUrl(proxy), media))) {
+          full = true;
+          r.progress = 0;
+          notify(media.id);
+          proxy = await window.nano.makeProxy(media, { full });
+        }
+        r.previewPath = proxy;
+        r.lightProxy = !full;
       }
     }
     r.status = 'ready';
@@ -211,6 +222,36 @@ export async function reviveMedia(project) {
 
 export function retryMedia(media) {
   return prepare(media);
+}
+
+export const TONEMAP_DEFAULT = { curve: 'hable', brightness: 0 };
+
+/**
+ * Cambia cómo se convierte a SDR un video HDR y vuelve a preparar su vista previa.
+ * La exportación usa los mismos ajustes, así que sigue viéndose igual que en el editor.
+ */
+export async function setTonemap(mediaId, tonemap) {
+  const media = state.project.media.find((m) => m.id === mediaId);
+  if (!media) return;
+  mutateSilently(() => {
+    media.tonemap = { curve: tonemap.curve, brightness: tonemap.brightness };
+  });
+  const r = rt(media.id);
+  r.poster = null;
+  const th = thumbers.get(media.id);
+  if (th) {
+    releaseElement(th.el);
+    thumbers.delete(media.id);
+  }
+  for (const [key, e] of [...thumbCache]) {
+    if (key.startsWith(`${media.id}@`)) {
+      e.bmp.close?.();
+      thumbCache.delete(key);
+    }
+  }
+  await prepare(media);
+  emit('media-reload', media.id);
+  notifyThumbs();
 }
 
 window.nano?.on('media:proxyProgress', ({ path, progress }) => {

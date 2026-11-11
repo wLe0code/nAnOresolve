@@ -229,9 +229,16 @@ async function probe(file) {
     });
     audioOk = NATIVE_AUDIO.has(a.codec_name) || (isWav && NATIVE_PCM.has(a.codec_name));
     if (isMp4Family && a.codec_name === 'vorbis') audioOk = false;
+    // El sonido envolvente (5.1, 7.1…) se pasa siempre a estéreo con FFmpeg, igual que al exportar:
+    // así la vista previa y el archivo final suenan idénticos.
+    if (info.channels > 2) audioOk = false;
   }
 
   info.nativeHint = containerOk && videoOk && audioOk;
+  // La imagen se puede reproducir tal cual aunque el audio no: basta una copia ligera que solo
+  // convierte el sonido.
+  info.videoNative = !!v && containerOk && videoOk;
+  info.mp4Family = isMp4Family;
   return info;
 }
 

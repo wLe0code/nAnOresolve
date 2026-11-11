@@ -7,9 +7,23 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { binaries, capabilities } = require('./ffmpeg');
 
-// Conversión HDR (PQ/HLG) -> SDR Rec.709 para que vista previa y exportación coincidan.
-const TONEMAP_CHAIN =
-  'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p';
+// Conversión HDR (PQ/HLG) -> SDR Rec.709. La vista previa y la exportación usan la misma cadena,
+// con los ajustes que el usuario haya elegido para ese archivo (info.tonemap).
+const TONEMAP_CURVES = ['hable', 'mobius', 'reinhard', 'clip'];
+
+function tonemapSettings(info) {
+  const t = (info && info.tonemap) || {};
+  const curve = TONEMAP_CURVES.includes(t.curve) ? t.curve : 'hable';
+  const brightness = Math.max(-2, Math.min(2, Number(t.brightness) || 0));
+  return { curve, brightness: Math.round(brightness * 10) / 10 };
+}
+
+function tonemapChain(info) {
+  const { curve, brightness } = tonemapSettings(info);
+  // Brillo en pasos de exposición: bajar el pico nominal aclara la imagen.
+  const npl = Math.round(100 / Math.pow(2, brightness));
+  return `zscale=t=linear:npl=${npl},format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=${curve}:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p`;
+}
 
 function cacheKey(info, salt) {
   return crypto.createHash('sha1').update(`${info.path}|${info.size}|${info.mtimeMs}|${salt}`).digest('hex');
@@ -31,6 +45,8 @@ async function exists(file) {
 /** Matriz de color de entrada cuando el archivo no la declara (misma heurística que Chromium). */
 function guessMatrix(info) {
   if (info.colorSpace) return '';
+  // VP9 sin etiquetar se muestra siempre como BT.709, sea cual sea su tamaño (medido en la vista previa).
+  if (info.videoCodec === 'vp9') return 'bt709';
   return info.height > 576 || info.width >= 1280 ? 'bt709' : 'smpte170m';
 }
 
@@ -43,19 +59,24 @@ const activeProxies = new Set();
  * Genera (o reutiliza) un archivo de vista previa reproducible por el motor de la app.
  * El archivo original nunca se toca: la exportación siempre lee el original.
  */
-function ensureProxy(info, cacheDir, onProgress) {
-  const job = proxyChain.then(() => buildProxy(info, cacheDir, onProgress));
+function ensureProxy(info, cacheDir, onProgress, opts = {}) {
+  const job = proxyChain.then(() => buildProxy(info, cacheDir, onProgress, opts));
   proxyChain = job.catch(() => {});
   return job;
 }
 
-async function buildProxy(info, cacheDir, onProgress) {
+async function buildProxy(info, cacheDir, onProgress, opts = {}) {
   const dir = path.join(cacheDir, 'proxy');
   await fs.promises.mkdir(dir, { recursive: true });
-  const ext = info.type === 'video' ? 'mp4' : info.type === 'audio' ? 'm4a' : 'png';
-  const out = path.join(dir, `${cacheKey(info, 'proxy-v2')}.${ext}`);
+  // Copia ligera: la imagen ya es reproducible y solo hay que convertir el audio (segundos en
+  // vez de minutos). Si luego no se reproduce bien, la interfaz pide la copia completa.
+  const light = info.type === 'video' && info.videoNative && info.hasAudio && !opts.full;
+  const ext = info.type === 'video' ? (light && !info.mp4Family ? 'mkv' : 'mp4') : info.type === 'audio' ? 'm4a' : 'png';
+  const tm = tonemapSettings(info);
+  const salt = light ? 'proxy-v3-light' : `proxy-v3${info.hdr ? `|${tm.curve}|${tm.brightness}` : ''}`;
+  const out = path.join(dir, `${cacheKey(info, salt)}.${ext}`);
   if (await exists(out)) return out;
-  const tmp = path.join(dir, `${cacheKey(info, 'proxy-v2')}.part.${ext}`);
+  const tmp = path.join(dir, `${cacheKey(info, salt)}.part.${ext}`);
   const caps = await capabilities();
   const { ffmpeg } = binaries();
 
@@ -64,13 +85,18 @@ async function buildProxy(info, cacheDir, onProgress) {
     args.push('-frames:v', '1', '-vf', 'format=rgba', tmp);
   } else if (info.type === 'audio') {
     args.push('-map', `0:${info.audioIndex}`, '-vn', '-sn', '-dn', '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-ar', '48000', '-movflags', '+faststart', tmp);
+  } else if (light) {
+    args.push('-map', `0:${info.videoIndex}`, '-map', `0:${info.audioIndex}`, '-sn', '-dn', '-c:v', 'copy');
+    if (info.mp4Family) args.push('-c:a', 'aac', '-b:a', '256k', '-ac', '2', '-ar', '48000', '-movflags', '+faststart');
+    else args.push('-c:a', 'libopus', '-b:a', '192k', '-ac', '2', '-ar', '48000');
+    args.push('-max_muxing_queue_size', '2048', tmp);
   } else {
     const scale = Math.min(1, 1280 / Math.max(info.width, info.height));
     const pw = even(info.width * scale);
     const ph = even(info.height * scale);
     const vf = [];
     if (info.interlaced) vf.push('yadif=0:-1:0');
-    if (info.hdr && caps.filters.has('zscale') && caps.filters.has('tonemap')) vf.push(TONEMAP_CHAIN);
+    if (info.hdr && caps.filters.has('zscale') && caps.filters.has('tonemap')) vf.push(tonemapChain(info));
     if (info.fps > 62) vf.push('fps=60');
     vf.push(`scale=${pw}:${ph}:flags=bicubic`, 'setsar=1', 'format=yuv420p');
     args.push('-map', `0:${info.videoIndex}`);
@@ -184,4 +210,4 @@ async function saveRecording(dir, bytes, name) {
   return file;
 }
 
-module.exports = { ensureProxy, killProxies, computePeaks, saveRecording, guessMatrix, TONEMAP_CHAIN, PEAKS_PER_SECOND };
+module.exports = { ensureProxy, killProxies, computePeaks, saveRecording, guessMatrix, tonemapChain, PEAKS_PER_SECOND };

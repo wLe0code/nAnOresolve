@@ -13,6 +13,7 @@ import { Inspector, setSectionCollapsed } from './ui/inspector.js';
 import { buildToolbar } from './ui/toolbar.js';
 import { Recorder } from './audio/recorder.js';
 import { openExportDialog, isExporting } from './ui/exportui.js';
+import { openVideoSettings, settingsChip } from './ui/settingsui.js';
 import { exportProject } from './export/exporter.js';
 import { icon } from './ui/icons.js';
 import { toast, contextMenu, confirmDialog, modal } from './ui/widgets.js';
@@ -50,6 +51,7 @@ const SHORTCUTS = [
   ['Ctrl+S', 'Guardar proyecto'],
   ['Ctrl+I', 'Importar medios'],
   ['Ctrl+E', 'Exportar'],
+  ['Ctrl+K', 'Configuración del video (resolución y fps)'],
   ['Esc', 'Salir de la herramienta actual'],
 ];
 
@@ -146,6 +148,7 @@ function buildTopbar() {
           { label: 'Guardar como…', icon: 'save', shortcut: 'Ctrl+Mayús+S', run: () => saveProject(true) },
           '-',
           { label: 'Importar medios…', icon: 'import', shortcut: 'Ctrl+I', run: () => importDialog() },
+          { label: 'Configuración del video…', icon: 'film', shortcut: 'Ctrl+K', run: openVideoSettings },
           { label: 'Exportar…', icon: 'export', shortcut: 'Ctrl+E', run: openExportDialog },
           '-',
           { label: 'Atajos de teclado', icon: 'keyboard', run: showShortcuts },
@@ -167,12 +170,13 @@ function buildTopbar() {
     e.stopPropagation();
   });
   const saveState = document.getElementById('save-state');
+  const chip = settingsChip();
 
   const undoBtn = h('button', { class: 'icon-btn', title: 'Deshacer (Ctrl+Z)', html: icon('undo', 16), onclick: () => undo() });
   const redoBtn = h('button', { class: 'icon-btn', title: 'Rehacer (Ctrl+Y)', html: icon('redo', 16), onclick: () => redo() });
   const saveBtn = h('button', { class: 'icon-btn', title: 'Guardar (Ctrl+S)', html: icon('save', 16), onclick: () => saveProject(false) });
   const exportBtn = h('button', { class: 'btn primary export-btn', title: 'Exportar el video (Ctrl+E)', onclick: openExportDialog }, h('span', { html: icon('export', 15) }), 'Exportar');
-  document.getElementById('top-actions').append(undoBtn, redoBtn, saveBtn, exportBtn);
+  document.getElementById('top-actions').append(chip.el, undoBtn, redoBtn, saveBtn, exportBtn);
 
   const sync = () => {
     const p = state.project;
@@ -180,6 +184,7 @@ function buildTopbar() {
     nameInput.style.width = `${clamp(nameInput.value.length * 7.4 + 26, 120, 380)}px`;
     saveState.textContent = state.dirty ? 'Sin guardar' : state.projectPath ? 'Guardado' : '';
     saveState.classList.toggle('dirty', state.dirty);
+    chip.sync();
     undoBtn.disabled = !canUndo();
     redoBtn.disabled = !canRedo();
     wsButtons.forEach((b, i) => b.classList.toggle('on', WORKSPACES[i].id === state.workspace));
@@ -257,6 +262,7 @@ function setupShortcuts() {
         case 'n': newProject(); break;
         case 'i': importDialog(); break;
         case 'e': openExportDialog(); break;
+        case 'k': openVideoSettings(); break;
         case 'b': A.splitAtPlayhead(); break;
         case 'c': A.copySelection(); break;
         case 'x': if (A.copySelection()) A.deleteSelection(); break;
@@ -299,7 +305,7 @@ function setupShortcuts() {
           break;
         }
         case 'Escape':
-          if (state.viewerMode === 'censor') setUI({ viewerMode: null });
+          if (state.viewerMode === 'censor' || state.viewerMode === 'crop') setUI({ viewerMode: null });
           else if (state.viewerMode === 'record' && !recorder.recording) recorder.close();
           else if (state.tool !== 'select') setUI({ tool: 'select' });
           else if (state.activeCensor || state.activeZoom) setUI({ activeCensor: null, activeZoom: null });

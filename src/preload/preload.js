@@ -67,6 +67,7 @@ contextBridge.exposeInMainWorld('nano', {
 
   exportChoosePath: invoke('export:choosePath'),
   exportDirect: !!exporter,
+  exportHwEncoders: exp('hwEncoders', 'export:hwEncoders'),
   exportBegin: exp('begin', 'export:begin'),
   exportAudioWrite: exp('audioWrite', 'export:audioWrite'),
   exportStartEncoder: exp('startEncoder', 'export:startEncoder'),

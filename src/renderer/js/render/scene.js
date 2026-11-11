@@ -3,7 +3,7 @@
 
 import { clamp, mat } from '../core/util.js';
 import { evalProp } from '../core/keyframes.js';
-import { videoTracks, trackClips, clipEnd, mediaById, sourceTime, transInInfo, transOutInfo, zoomsAt, censorsAt } from '../core/model.js';
+import { videoTracks, trackClips, clipEnd, mediaById, sourceTime, transInInfo, transOutInfo, zoomsAt, censorsAt, MAX_CROP } from '../core/model.js';
 import { layoutText } from './textrender.js';
 
 const T_EPS = 1e-6;
@@ -32,6 +32,30 @@ function evalEffects(clip, ts) {
     }
   }
   return fx;
+}
+
+const NO_CROP = [0, 0, 0, 0];
+
+/** Recorte de un clip en ts: [izquierda, arriba, derecha, abajo] como fracción de la imagen. */
+export function evalCrop(clip, ts) {
+  if (clip.type !== 'video' && clip.type !== 'image') return NO_CROP;
+  let l = clamp(evalProp(clip, 'cropL', ts) || 0, 0, 1);
+  let t = clamp(evalProp(clip, 'cropT', ts) || 0, 0, 1);
+  let r = clamp(evalProp(clip, 'cropR', ts) || 0, 0, 1);
+  let b = clamp(evalProp(clip, 'cropB', ts) || 0, 0, 1);
+  if (!l && !t && !r && !b) return NO_CROP;
+  // Dos bordes opuestos animados nunca llegan a cruzarse.
+  if (l + r > MAX_CROP) {
+    const k = MAX_CROP / (l + r);
+    l *= k;
+    r *= k;
+  }
+  if (t + b > MAX_CROP) {
+    const k = MAX_CROP / (t + b);
+    t *= k;
+    b *= k;
+  }
+  return [l, t, r, b];
 }
 
 /** Tamaño base (en píxeles de proyecto) de la imagen de un clip a escala 1. */
@@ -65,6 +89,7 @@ export function evalLayer(project, clip, t) {
     scale: Math.max(0.001, evalProp(clip, 'scale', ts)),
     rotation: evalProp(clip, 'rotation', ts),
     opacity,
+    crop: evalCrop(clip, ts),
     zooms: zoomsAt(clip, ts),
     censors: censorsAt(clip, ts),
     fx: evalEffects(clip, ts),
@@ -142,7 +167,10 @@ export function hitLayer(scene, px, py, filter) {
     if (filter && !filter(layer)) continue;
     const inv = mat.invert(layerMatrix(layer, scene.width, scene.height));
     const [lx, ly] = mat.apply(inv, px, py);
-    if (Math.abs(lx) <= 0.5 && Math.abs(ly) <= 0.5) return { layer, u: lx + 0.5, v: ly + 0.5 };
+    const u = lx + 0.5;
+    const v = ly + 0.5;
+    const [cl, ct, cr, cb] = layer.crop || NO_CROP;
+    if (u >= cl && u <= 1 - cr && v >= ct && v <= 1 - cb) return { layer, u, v };
   }
   return null;
 }

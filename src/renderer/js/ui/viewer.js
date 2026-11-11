@@ -1,5 +1,5 @@
 // Visor: lienzo de vista previa, controles de reproducción y tiradores sobre la imagen
-// (mover / escalar / girar clips, dibujar y ajustar censuras, elegir el foco del zoom).
+// (mover / escalar / girar clips, recortar la imagen, dibujar y ajustar censuras, elegir el foco del zoom).
 
 import { state, on, emit, setUI, select, primaryClip, beginTxn, endTxn, touch } from '../core/store.js';
 import * as M from '../core/model.js';
@@ -18,6 +18,8 @@ function s(tag, attrs = {}) {
   for (const [k, v] of Object.entries(attrs)) if (v !== null && v !== undefined) el.setAttribute(k, v);
   return el;
 }
+
+const isCroppable = (clip) => !!clip && (clip.type === 'video' || clip.type === 'image');
 
 const pts = (list) => list.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
 
@@ -41,11 +43,16 @@ export class Viewer {
     engine.init(this.canvas);
     this.buildTransport();
     this.buildCensorHud();
+    this.buildCropHud();
 
     this.renderOverlay = rafThrottle(() => this.paintOverlay());
     new ResizeObserver(() => this.resize()).observe(this.stage);
     on('frame', () => this.renderOverlay());
-    on('selection', () => this.renderOverlay());
+    on('selection', () => {
+      // El recorte en el visor solo tiene sentido con un video o una imagen seleccionados.
+      if (state.viewerMode === 'crop' && !isCroppable(primaryClip())) setUI({ viewerMode: null });
+      this.renderOverlay();
+    });
     on('project', (info) => {
       if (!info || info.load || info.label === 'Ajustes del proyecto' || info.restore) this.resize();
       this.updateEmpty();
@@ -55,6 +62,10 @@ export class Viewer {
     on('ui', (keys) => {
       if (keys.includes('playing')) this.updatePlayButton();
       if (keys.includes('viewerMode') || keys.includes('censorMode') || keys.includes('censorShape')) this.updateCensorHud();
+      if (keys.includes('viewerMode')) {
+        this.cropHud.classList.toggle('show', state.viewerMode === 'crop');
+        this.resize();
+      }
       this.renderOverlay();
     });
 
@@ -77,10 +88,13 @@ export class Viewer {
   resize() {
     const p = state.project;
     if (!p) return;
+    // Al recortar se deja una franja libre arriba para la barra de ayuda: así no tapa ningún tirador.
+    const band = state.viewerMode === 'crop' ? 44 : 0;
+    this.stage.style.paddingTop = band ? `${band}px` : '';
     const r = this.stage.getBoundingClientRect();
     const pad = 14;
     const aw = Math.max(40, r.width - pad * 2);
-    const ah = Math.max(40, r.height - pad * 2);
+    const ah = Math.max(40, r.height - pad * 2 - band);
     const { width: W, height: H } = p.settings;
     const k = Math.min(aw / W, ah / H);
     this.fw = Math.max(20, Math.floor(W * k));
@@ -188,6 +202,24 @@ export class Viewer {
     this.overlay.classList.toggle('censor-mode', state.viewerMode === 'censor');
   }
 
+  // ------------------------------------------------------------------ recorte ----
+
+  buildCropHud() {
+    const reset = () => {
+      const c = primaryClip();
+      if (isCroppable(c)) A.resetCrop(c);
+    };
+    this.cropHud = h(
+      'div',
+      { class: 'hud-bar crop-hud' },
+      h('span', { class: 'hud-ico', html: icon('crop', 16) }),
+      h('span', { class: 'hud-text' }, 'Arrastra los bordes para recortar la imagen'),
+      h('button', { class: 'btn small', onclick: reset }, 'Restablecer'),
+      h('button', { class: 'btn small primary', onclick: () => setUI({ viewerMode: null }) }, 'Listo')
+    );
+    this.hud.append(this.cropHud);
+  }
+
   // --------------------------------------------------------------- tiradores ----
 
   toProject(e) {
@@ -234,14 +266,49 @@ export class Viewer {
         return [x * k, y * k];
       };
       const censorMode = state.viewerMode === 'censor';
+      const cropMode = state.viewerMode === 'crop' && isCroppable(clip);
       const activeCensor = (clip.censors || []).find((r) => r.id === state.activeCensor);
       const activeZoom = (clip.zooms || []).find((z) => z.id === state.activeZoom);
-      const transformMode = !censorMode && !activeCensor && !activeZoom;
-      const corners = [P(-0.5, -0.5), P(0.5, -0.5), P(0.5, 0.5), P(-0.5, 0.5)];
+      const transformMode = !censorMode && !cropMode && !activeCensor && !activeZoom;
+      // Zona visible del clip (toda la imagen si no hay recorte), en coordenadas locales.
+      const [cl, ct, cr, cb] = layer.crop;
+      const x0 = cl - 0.5;
+      const x1 = 0.5 - cr;
+      const y0 = ct - 0.5;
+      const y1 = 0.5 - cb;
+      const full = [P(-0.5, -0.5), P(0.5, -0.5), P(0.5, 0.5), P(-0.5, 0.5)];
+      const corners = [P(x0, y0), P(x1, y0), P(x1, y1), P(x0, y1)];
 
-      const box = s('polygon', { points: pts(corners), class: `gz-box${transformMode ? '' : ' dim'}` });
-      if (transformMode) box.dataset.role = 'move';
-      svg.append(box);
+      if (cropMode) {
+        const ring = (list) => `M${list.map(([x, y]) => `${x.toFixed(1)} ${y.toFixed(1)}`).join('L')}Z`;
+        svg.append(s('path', { d: ring(full) + ring(corners), 'fill-rule': 'evenodd', class: 'gz-crop-dim' }));
+        for (const f of [1 / 3, 2 / 3]) {
+          const a = P(x0 + (x1 - x0) * f, y0);
+          const b = P(x0 + (x1 - x0) * f, y1);
+          const c = P(x0, y0 + (y1 - y0) * f);
+          const d = P(x1, y0 + (y1 - y0) * f);
+          svg.append(s('line', { x1: a[0], y1: a[1], x2: b[0], y2: b[1], class: 'gz-crop-grid' }));
+          svg.append(s('line', { x1: c[0], y1: c[1], x2: d[0], y2: d[1], class: 'gz-crop-grid' }));
+        }
+        const win = s('polygon', { points: pts(corners), class: 'gz-crop' });
+        win.dataset.role = 'crop-move';
+        svg.append(win);
+        for (const hx of [-1, 0, 1]) {
+          for (const hy of [-1, 0, 1]) {
+            if (!hx && !hy) continue;
+            const [px, py] = P(hx < 0 ? x0 : hx > 0 ? x1 : (x0 + x1) / 2, hy < 0 ? y0 : hy > 0 ? y1 : (y0 + y1) / 2);
+            const hd = s('rect', { x: px - 5, y: py - 5, width: 10, height: 10, rx: 2, class: 'gz-handle crop' });
+            hd.dataset.role = 'crop-size';
+            hd.dataset.hx = hx;
+            hd.dataset.hy = hy;
+            svg.append(hd);
+          }
+        }
+      } else {
+        const box = s('polygon', { points: pts(corners), class: `gz-box${transformMode ? '' : ' dim'}` });
+        if (transformMode) box.dataset.role = 'move';
+        svg.append(box);
+      }
 
       // Regiones de censura del clip
       const ts = layer.ts;
@@ -305,10 +372,11 @@ export class Viewer {
           hd.dataset.role = 'scale';
           svg.append(hd);
         }
-        const top = P(0, -0.5);
+        const top = P((x0 + x1) / 2, y0);
+        const up = P(0, -0.5);
         const center = P(0, 0);
-        const dx = top[0] - center[0];
-        const dy = top[1] - center[1];
+        const dx = up[0] - center[0];
+        const dy = up[1] - center[1];
         const len = Math.hypot(dx, dy) || 1;
         const rx = top[0] + (dx / len) * 26;
         const ry = top[1] + (dy / len) * 26;
@@ -417,6 +485,15 @@ export class Viewer {
       d.rect = { x, y, w, h: hh, l: x - w / 2, r: x + w / 2, t: y - hh / 2, b: y + hh / 2 };
       d.hx = Number(e.target.dataset.hx || 0);
       d.hy = Number(e.target.dataset.hy || 0);
+    } else if (role === 'crop-move' || role === 'crop-size') {
+      const [lx, ly] = mat.apply(inv, px, py);
+      const c = A.cropAt(clip, ts);
+      d.inv = inv;
+      d.u0 = lx + 0.5;
+      d.v0 = ly + 0.5;
+      d.rect = { l: c.cropL, t: c.cropT, r: 1 - c.cropR, b: 1 - c.cropB };
+      d.hx = Number(e.target.dataset.hx || 0);
+      d.hy = Number(e.target.dataset.hy || 0);
     } else if (role === 'zoom-focus') {
       d.zoom = clip.zooms.find((z) => z.id === state.activeZoom);
       if (!d.zoom) return;
@@ -487,6 +564,25 @@ export class Viewer {
       if (d.hy < 0) t = Math.min(v, b - 0.01);
       if (d.hy > 0) b = Math.max(v, t + 0.01);
       A.writeCensorRect(clip, d.region, { x: (l + r) / 2, y: (t + b) / 2, w: r - l, h: b - t });
+    } else if (d.kind === 'crop-size') {
+      const [lx, ly] = mat.apply(d.inv, px, py);
+      // Cerca del borde de la imagen el recorte se pega a él (Ctrl lo evita).
+      const snap = (x) => (!e.ctrlKey && x < 0.012 ? 0 : !e.ctrlKey && x > 0.988 ? 1 : x);
+      const u = snap(clamp(lx + 0.5, 0, 1));
+      const v = snap(clamp(ly + 0.5, 0, 1));
+      const { l, r, t, b } = d.rect;
+      const out = {};
+      if (d.hx < 0) out.cropL = Math.min(u, r - 0.02);
+      if (d.hx > 0) out.cropR = 1 - Math.max(u, l + 0.02);
+      if (d.hy < 0) out.cropT = Math.min(v, b - 0.02);
+      if (d.hy > 0) out.cropB = 1 - Math.max(v, t + 0.02);
+      A.writeCrop(clip, out);
+    } else if (d.kind === 'crop-move') {
+      const [lx, ly] = mat.apply(d.inv, px, py);
+      const { l, r, t, b } = d.rect;
+      const du = clamp(lx + 0.5 - d.u0, -l, 1 - r);
+      const dv = clamp(ly + 0.5 - d.v0, -t, 1 - b);
+      A.writeCrop(clip, { cropL: l + du, cropR: 1 - (r + du), cropT: t + dv, cropB: 1 - (b + dv) });
     } else if (d.kind === 'zoom-focus') {
       const [lx, ly] = mat.apply(d.inv, px, py);
       d.zoom.cx = Math.round(clamp(lx + 0.5, 0, 1) * 1000) / 1000;

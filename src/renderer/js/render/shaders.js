@@ -25,6 +25,7 @@ uniform vec2 uTexSize;    // tamaño en texels
 uniform vec2 uUnit;       // uv equivalente a "1 lado menor"
 uniform vec2 uRef;        // uv de un píxel de referencia (1/1080 del lado menor)
 uniform float uOpacity;
+uniform vec4 uCrop;       // recorte de cada borde en uv: izquierda, arriba, derecha, abajo
 uniform float uStraight;  // 1 = la textura no está premultiplicada
 uniform float uTime;
 
@@ -132,7 +133,8 @@ float hash(vec2 p) {
 void main() {
   vec2 uv = vUv;
   vec2 fw = max(fwidth(uv), vec2(1e-6));
-  vec2 cov2 = clamp((0.5 - abs(uv - 0.5)) / fw + 0.5, 0.0, 1.0);
+  // Cobertura suavizada del borde de la imagen (o del recorte, si lo hay).
+  vec2 cov2 = clamp(min(uv - uCrop.xy, (1.0 - uCrop.zw) - uv) / fw + 0.5, 0.0, 1.0);
   float cov = cov2.x * cov2.y;
 
   vec4 c = texture(uTex, mapUv(uv));
@@ -190,6 +192,51 @@ out vec2 vUv;
 void main() {
   vUv = aPos;
   gl_Position = vec4((aPos * 2.0 - 1.0) * vec2(1.0, uFlip), 0.0, 1.0);
+}`;
+
+// --- Exportación rápida ---------------------------------------------------------------------
+// Los fotogramas viajan entre FFmpeg y el compositor como YUV 4:2:0 (NV12, 1,5 bytes por píxel)
+// en vez de RGB/RGBA (3-4 bytes): menos datos por las tuberías y la conversión de color la
+// hace la tarjeta gráfica. Siempre BT.709/601/2020 de rango limitado.
+
+// NV12 decodificado -> RGB. uY: plano de luma; uUV: plano de croma intercalado.
+export const FRAG_YUV_IN = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D uY;
+uniform sampler2D uUV;
+uniform vec4 uCoef;       // Cr->R, Cb->G, Cr->G, Cb->B
+uniform float uChromaShift; // medio píxel de luma: la croma 4:2:0 va alineada a la izquierda
+void main() {
+  float y = (texture(uY, vUv).r * 255.0 - 16.0) / 219.0;
+  vec2 c = (texture(uUV, vUv + vec2(uChromaShift, 0.0)).rg * 255.0 - 128.0) / 224.0;
+  vec3 rgb = vec3(y + uCoef.x * c.y, y - uCoef.y * c.x - uCoef.z * c.y, y + uCoef.w * c.x);
+  outColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+}`;
+
+// Imagen compuesta (RGB) -> NV12 BT.709 de rango limitado, lista para el codificador.
+// Las filas 0..H-1 del destino llevan la luma y las H/2 siguientes la croma intercalada.
+export const FRAG_NV12_OUT = `#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform sampler2D uSrc;
+uniform int uH;
+const vec3 KY = vec3(0.2126, 0.7152, 0.0722);
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  float v;
+  if (p.y < uH) {
+    v = 16.0 + 219.0 * dot(texelFetch(uSrc, p, 0).rgb, KY);
+  } else {
+    int cy = (p.y - uH) * 2;
+    int cx = (p.x / 2) * 2;
+    vec3 c = (texelFetch(uSrc, ivec2(cx, cy), 0).rgb + texelFetch(uSrc, ivec2(cx + 1, cy), 0).rgb
+            + texelFetch(uSrc, ivec2(cx, cy + 1), 0).rgb + texelFetch(uSrc, ivec2(cx + 1, cy + 1), 0).rgb) * 0.25;
+    float y = dot(c, KY);
+    v = (p.x & 1) == 0 ? 128.0 + 224.0 * (c.b - y) / 1.8556 : 128.0 + 224.0 * (c.r - y) / 1.5748;
+  }
+  outColor = vec4(v / 255.0, 0.0, 0.0, 1.0);
 }`;
 
 // Transiciones entre dos imágenes ya compuestas (A sale, B entra). Colores premultiplicados.
