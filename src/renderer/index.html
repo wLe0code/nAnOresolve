@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self' data:; worker-src 'self' blob:"
+    />
+    <title>nAnOresolve</title>
+    <link rel="stylesheet" href="styles/app.css" />
+  </head>
+  <body>
+    <div id="app" class="ws-cut">
+      <header id="topbar">
+        <div class="brand">
+          <span class="logo"></span>
+          <span class="brand-name">nAnO<b>resolve</b></span>
+          <span class="beta">BETA 1.0</span>
+        </div>
+        <nav id="file-menu"></nav>
+        <div id="workspaces"></div>
+        <div id="project-box">
+          <input id="project-name" spellcheck="false" maxlength="80" title="Nombre del proyecto" />
+          <span id="save-state"></span>
+        </div>
+        <div id="top-actions"></div>
+      </header>
+
+      <main id="main">
+        <section id="upper">
+          <aside id="left-panel">
+            <div id="left-tabs"></div>
+            <div id="left-body"></div>
+          </aside>
+          <div class="splitter split-v" data-target="left"></div>
+          <section id="viewer">
+            <div id="viewer-stage">
+              <div id="viewer-frame">
+                <canvas id="preview"></canvas>
+                <div id="overlay"></div>
+              </div>
+              <div id="viewer-empty"></div>
+              <div id="viewer-hud"></div>
+            </div>
+            <div id="transport"></div>
+          </section>
+          <div class="splitter split-v" data-target="right"></div>
+          <aside id="inspector"></aside>
+        </section>
+
+        <div class="splitter split-h" data-target="timeline"></div>
+
+        <section id="timeline-panel">
+          <div id="tl-toolbar"></div>
+          <div id="tl-body">
+            <div id="tl-headers">
+              <div id="tl-corner"></div>
+              <div id="tl-track-headers"></div>
+            </div>
+            <div id="tl-main">
+              <canvas id="tl-ruler"></canvas>
+              <div id="tl-tracks"><canvas id="tl-canvas"></canvas></div>
+              <div id="tl-hscroll"><div id="tl-hscroll-inner"></div></div>
+              <div id="tl-playhead"><div class="ph-head"></div></div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <div id="toasts"></div>
+      <div id="modal-root"></div>
+      <div id="drop-veil"><div>Suelta los archivos para importarlos</div></div>
+    </div>
+    <script type="module" src="js/app.js"></script>
+  </body>
+</html>

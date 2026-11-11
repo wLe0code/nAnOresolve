@@ -1,0 +1,24 @@
+{
+  "name": "nanoresolve",
+  "productName": "nAnOresolve",
+  "version": "1.0.0-beta.1",
+  "description": "Editor de video de escritorio: cortes, voz en off, efectos, transiciones, zoom, textos, keyframes, color y censura.",
+  "main": "src/main/main.js",
+  "author": "Leo",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "test:smoke": "electron scripts/smoke.js",
+    "package": "electron-packager . nAnOresolve --platform=win32 --arch=x64 --out=dist --overwrite --asar.unpack=\"**/node_modules/{ffmpeg-static,@ffprobe-installer}/**\" --ignore=\"^/(scripts|dist|\\.claude)\" --prune=true"
+  },
+  "dependencies": {
+    "@ffprobe-installer/ffprobe": "^2.1.2",
+    "ffmpeg-static": "^5.3.0"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^45.2.3"
+  }
+}
